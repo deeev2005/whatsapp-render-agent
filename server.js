@@ -12,11 +12,14 @@ let clientStatus = 'STARTING';
 let sock = null;
 
 // ==================================================================
-// 🎯 AgenticOrg Workflow Configuration
+// 🤖 AgenticOrg Virtual Employee Configuration (piiriya)
 // ==================================================================
-const WORKFLOW_ID = process.env.AGENTICORG_WORKFLOW_ID || '6099d951-d8d9-4144-a2f6-a2320324a148';
-const AGENTICORG_BASE_URL = 'https://agenticorg.hackathon.pinelabs.com';
-const AGENTICORG_API_KEY = process.env.AGENTICORG_API_KEY || '';
+const AGENT_ID = process.env.AGENT_ID || 'abd04322-db21-4d01-a937-941ef9c68a30';
+const AGENTICORG_URL = `https://agenticorg.hackathon.pinelabs.com/api/v1/agents/${AGENT_ID}/run`;
+
+// Session credentials from your environment or defaults
+const AGENTICORG_SESSION = process.env.AGENTICORG_SESSION || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ2ZXJtYWRlZXBlc2gxNUBnbWFpbC5jb20iLCJhZ2VudGljb3JnOnRlbmFudF9pZCI6ImFiYjYxYmNhLWEzZjUtNGFiYS1iMzBlLTk0NjAxNmIxMzEyMCIsImFnZW50aWNvcmc6dXNlcl9pZCI6ImU1ZjA3MDU2LWYxNmEtNGExZC04YzFmLTY0ZTIzNTUyNGFhNyIsImdyYW50ZXg6c2NvcGVzIjpbImFnZW50czpyZWFkIiwiYWdlbnRzOndyaXRlIiwid29ya2Zsb3dzOnJlYWQiLCJ3b3JrZmxvd3M6d3JpdGUiLCJhdWRpdDpyZWFkIiwiY29ubmVjdG9yczpyZWFkIiwiY29ubmVjdG9yczpjcmVhdGUiLCJjb25uZWN0b3JzOnVwZGF0ZSIsImNvbm5lY3RvcnM6ZGVsZXRlIl0sIm5hbWUiOiJkZWVwZXNoIiwicm9sZSI6ImRldmVsb3BlciIsImRvbWFpbiI6ImJhY2tvZmZpY2UiLCJhZ2VudGljb3JnOmRvbWFpbnMiOlsiYmFja29mZmljZSJdLCJpc3MiOiJhZ2VudGljb3JnLWxvY2FsIiwiYXVkIjoiYWdlbnRpY29yZy10b29sLWdhdGV3YXkiLCJpYXQiOjE3OTA5NDMwNjYsImV4cCI6MTc5MDk0NjY2Nn0.sM7uEAHMpWIRdi3zW4pen6NbMD69LR3dlPP-bwcLIOY';
+const CSRF_TOKEN = process.env.CSRF_TOKEN || 'QJE9aot3_2sADzJaR4Rx2nKWsxqnJqyul7Lh-7dKhxM';
 
 function getISTDate() {
     return new Date();
@@ -63,7 +66,7 @@ async function startWhatsApp() {
         }
     });
 
-    // Handle Incoming Messages
+    // Handle incoming WhatsApp messages
     sock.ev.on('messages.upsert', async ({ messages, type }) => {
         if (type !== 'notify') return;
 
@@ -78,61 +81,57 @@ async function startWhatsApp() {
             const isFromMe = msg.key.fromMe;
 
             if (!text) continue;
-            // Ignore messages sent by ourselves unless testing with !ping
             if (isFromMe && text.toLowerCase() !== '!ping') continue;
 
             console.log(`📩 [WhatsApp Message from ${senderName} (${senderJid})]: ${text}`);
 
             // 1. Built-in test ping
             if (text.toLowerCase() === '!ping') {
-                await sock.sendMessage(senderJid, { text: 'pong! 🏓 WhatsApp bridge is connected to AgenticOrg Workflow.' });
+                await sock.sendMessage(senderJid, { text: 'pong! 🏓 WhatsApp Agent piiriya is online and connected.' });
                 continue;
             }
 
-            // 2. Trigger AgenticOrg Workflow (7-Step AI Pipeline)
+            // 2. Call AgenticOrg Virtual Employee (piiriya)
             try {
-                console.log(`🚀 Triggering Workflow [${WORKFLOW_ID}] on AgenticOrg...`);
+                console.log(`🤖 Forwarding message to AgenticOrg Agent [${AGENT_ID}]...`);
 
                 const payload = {
-                    sender_id: senderJid,
-                    sender_name: senderName,
-                    message: text,
-                    timestamp: new Date().toISOString()
+                    action: "run",
+                    csrf_token: CSRF_TOKEN,
+                    inputs: {
+                        task: text
+                    }
                 };
 
-                const headers = { 'Content-Type': 'application/json' };
-                if (AGENTICORG_API_KEY) {
-                    headers['Authorization'] = `Bearer ${AGENTICORG_API_KEY}`;
-                    headers['x-api-key'] = AGENTICORG_API_KEY;
-                }
+                const response = await axios.post(AGENTICORG_URL, payload, {
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Accept': 'application/json, text/plain, */*',
+                        'x-csrf-token': CSRF_TOKEN,
+                        'Cookie': `agenticorg_session=${AGENTICORG_SESSION}; agenticorg_csrf=${CSRF_TOKEN}`,
+                        'Authorization': `Bearer ${AGENTICORG_SESSION}`,
+                        'Origin': 'https://agenticorg.hackathon.pinelabs.com',
+                        'Referer': `https://agenticorg.hackathon.pinelabs.com/dashboard/agents/${AGENT_ID}`
+                    },
+                    timeout: 45000
+                });
 
-                // Send to AgenticOrg Workflow endpoint
-                const runUrl = `${AGENTICORG_BASE_URL}/api/workflows/${WORKFLOW_ID}/run`;
-                const response = await axios.post(runUrl, payload, { headers, timeout: 45000 });
+                console.log('✅ AgenticOrg Response:', JSON.stringify(response.data, null, 2));
 
-                console.log('✅ AgenticOrg Workflow Result:', response.data);
-
-                // Extract reply from the workflow output
-                const result = response.data;
-                const replyText = 
-                    result.output?.reply ||
-                    result.output?.message ||
-                    result.output?.response ||
-                    result.response ||
-                    result.reply ||
-                    (typeof result.output === 'string' ? result.output : null);
+                // Extract reply text from AgenticOrg response
+                const rawOutput = response.data?.output?.raw_output || response.data?.output?.response || response.data?.output;
+                const replyText = typeof rawOutput === 'object' ? JSON.stringify(rawOutput) : rawOutput;
 
                 if (replyText) {
                     await sock.sendMessage(senderJid, { text: String(replyText) });
-                } else if (result.status === 'success' || result.status === 'completed') {
-                    await sock.sendMessage(senderJid, { text: 'Your request has been processed by our AI workflow.' });
+                } else {
+                    await sock.sendMessage(senderJid, { text: 'Hello! I received your message, but the agent returned an empty response.' });
                 }
 
             } catch (err) {
-                console.error('❌ Error triggering AgenticOrg workflow:', err.response?.data || err.message);
-                // Fallback reply if workflow needs authentication or is pending
+                console.error('❌ Error executing AgenticOrg Agent:', err.response?.data || err.message);
                 await sock.sendMessage(senderJid, { 
-                    text: `Hello ${senderName}! We received your inquiry: "${text}". Our AI system has logged ticket for review.` 
+                    text: 'Sorry, I am having trouble connecting to the AgenticOrg AI engine right now.' 
                 });
             }
         }
@@ -148,7 +147,7 @@ app.get('/health', (req, res) => {
     res.json({
         status: 'ok',
         whatsappStatus: clientStatus,
-        workflowId: WORKFLOW_ID,
+        agentId: AGENT_ID,
         timeIST: getISTDate().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })
     });
 });
@@ -163,10 +162,10 @@ app.get('/', (req, res) => {
         res.send(`
             <html>
                 <body style="font-family: Arial, sans-serif; text-align: center; padding-top: 50px;">
-                    <h2 style="color: #25D366;">✅ WhatsApp AI Workflow Bridge is Online!</h2>
+                    <h2 style="color: #25D366;">✅ WhatsApp Virtual Employee (piiriya) is Online!</h2>
                     <p>Status: <strong>${clientStatus}</strong></p>
-                    <p>Connected Workflow ID: <code>${WORKFLOW_ID}</code></p>
-                    <p>Send a message on WhatsApp to trigger the 7-step AI pipeline!</p>
+                    <p>Connected Agent ID: <code>${AGENT_ID}</code></p>
+                    <p>Send a message on WhatsApp to chat with piiriya!</p>
                 </body>
             </html>
         `);
@@ -194,32 +193,9 @@ app.get('/', (req, res) => {
 });
 
 // ==================================================================
-// 🚀 Outbound Webhook endpoint: AgenticOrg can push messages to WhatsApp
-// ==================================================================
-app.post(['/send-message', '/api/send-message'], async (req, res) => {
-    const to = req.body.to || req.body.sender_id || req.body.recipient;
-    const message = req.body.message || req.body.text || req.body.body;
-
-    if (!to || !message) {
-        return res.status(400).json({ success: false, error: 'Missing recipient ("to") or "message"' });
-    }
-    if (!sock || clientStatus !== 'READY') {
-        return res.status(503).json({ success: false, error: 'WhatsApp client is not ready' });
-    }
-
-    try {
-        const jid = to.includes('@s.whatsapp.net') ? to : `${to.replace(/[^0-9]/g, '')}@s.whatsapp.net`;
-        await sock.sendMessage(jid, { text: String(message) });
-        res.json({ success: true, status: 'sent', to: jid });
-    } catch (err) {
-        res.status(500).json({ success: false, error: err.message });
-    }
-});
-
-// ==================================================================
 // 🚀 SERVER START
 // ==================================================================
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
-    console.log(`🚀 WhatsApp AI Workflow Server running on port ${PORT}`);
+    console.log(`🚀 Server running on port ${PORT}`);
 });
