@@ -13,7 +13,6 @@ let sock = null;
 // In-memory store for messages (for demo purposes)
 const receivedMessages = [];
 
-// Helper function for IST Date
 function getISTDate() {
     return new Date();
 }
@@ -59,7 +58,6 @@ async function startWhatsApp() {
         }
     });
 
-    // Capture incoming WhatsApp messages
     sock.ev.on('messages.upsert', async ({ messages, type }) => {
         if (type !== 'notify') return;
 
@@ -84,13 +82,11 @@ async function startWhatsApp() {
                 timestamp: new Date().toISOString()
             };
 
-            // Store in memory (keep last 50 messages)
             receivedMessages.unshift(messageRecord);
             if (receivedMessages.length > 50) receivedMessages.pop();
 
             console.log(`[WhatsApp Message from ${senderName}]: ${text}`);
 
-            // Built-in test ping
             if (text.toLowerCase() === '!ping') {
                 await sock.sendMessage(senderJid, { text: 'pong! 🏓 WhatsApp Connector is active and connected.' });
             }
@@ -101,19 +97,49 @@ async function startWhatsApp() {
 startWhatsApp();
 
 // ==================================================================
-// 🔌 Connector Endpoints (Used by AgenticOrg Custom Connector)
+// 🛠️ The 5 AgenticOrg Registered Tool Endpoints
 // ==================================================================
 
 /**
- * 1. Send WhatsApp Message
- * AgenticOrg agents call this endpoint to send an answer or alert.
- * Accepts: { "to": "919876543210", "message": "Hello from Agent!" }
+ * Tool 1: get_business_profile
+ * (AgenticOrg calls this for "Health Check" / "Test Connection")
  */
-app.post(['/send-message', '/api/send-message'], async (req, res) => {
-    const { to, message } = req.body;
-    
+app.all(['/get_business_profile', '/api/get_business_profile', '/business_profile'], (req, res) => {
+    res.json({
+        success: true,
+        status: 'healthy',
+        whatsapp_status: clientStatus,
+        profile: {
+            name: 'AgenticOrg WhatsApp Bot',
+            description: 'AI Virtual Employee Assistant',
+            status: clientStatus === 'READY' ? 'active' : 'connecting'
+        }
+    });
+});
+
+/**
+ * Tool 2: get_message_templates
+ */
+app.all(['/get_message_templates', '/api/get_message_templates'], (req, res) => {
+    res.json({
+        success: true,
+        templates: [
+            { name: 'general_reply', language: 'en', components: [] },
+            { name: 'invoice_alert', language: 'en', components: [] }
+        ]
+    });
+});
+
+/**
+ * Tool 3: send_text_message
+ * (Also handles /send-message)
+ */
+app.post(['/send_text_message', '/api/send_text_message', '/send-message', '/api/send-message'], async (req, res) => {
+    const to = req.body.to || req.body.recipient || req.body.phone_number || req.body.recipient_id;
+    const message = req.body.message || req.body.text || req.body.body;
+
     if (!to || !message) {
-        return res.status(400).json({ success: false, error: 'Missing required fields: "to" and "message"' });
+        return res.status(400).json({ success: false, error: 'Missing recipient ("to") or "message"' });
     }
     if (!sock || clientStatus !== 'READY') {
         return res.status(503).json({ success: false, error: 'WhatsApp client is not ready/connected' });
@@ -123,39 +149,66 @@ app.post(['/send-message', '/api/send-message'], async (req, res) => {
         const jid = to.includes('@s.whatsapp.net') ? to : `${to.replace(/[^0-9]/g, '')}@s.whatsapp.net`;
         await sock.sendMessage(jid, { text: String(message) });
         console.log(`📤 Sent message to ${jid}: ${message}`);
-        res.json({ success: true, status: 'sent', to: jid, message: message });
+        res.json({ success: true, status: 'sent', message_id: 'wa_' + Date.now(), to: jid });
     } catch (err) {
-        console.error('Error sending WhatsApp message:', err);
+        console.error('Error sending message:', err);
         res.status(500).json({ success: false, error: err.message });
     }
 });
 
 /**
- * 2. Get Last Received Message
- * Allows the agent to poll or read the latest incoming message.
+ * Tool 4: send_media_message
  */
-app.get(['/last-message', '/api/last-message'], (req, res) => {
-    const latest = receivedMessages.find(m => !m.isFromMe) || receivedMessages[0] || null;
-    res.json({ success: true, message: latest });
+app.post(['/send_media_message', '/api/send_media_message'], async (req, res) => {
+    const to = req.body.to || req.body.recipient;
+    const caption = req.body.caption || req.body.text || '';
+    const mediaUrl = req.body.media_url || req.body.url;
+
+    if (!to) {
+        return res.status(400).json({ success: false, error: 'Missing "to"' });
+    }
+    if (!sock || clientStatus !== 'READY') {
+        return res.status(503).json({ success: false, error: 'WhatsApp client is not ready' });
+    }
+
+    try {
+        const jid = to.includes('@s.whatsapp.net') ? to : `${to.replace(/[^0-9]/g, '')}@s.whatsapp.net`;
+        if (mediaUrl) {
+            await sock.sendMessage(jid, { image: { url: mediaUrl }, caption: caption });
+        } else {
+            await sock.sendMessage(jid, { text: caption });
+        }
+        res.json({ success: true, status: 'sent' });
+    } catch (err) {
+        res.status(500).json({ success: false, error: err.message });
+    }
 });
 
 /**
- * 3. List Recent Messages
- * Allows AgenticOrg to fetch conversation history.
+ * Tool 5: send_template_message
  */
-app.get(['/messages', '/api/messages'], (req, res) => {
-    const limit = parseInt(req.query.limit) || 10;
-    res.json({
-        success: true,
-        count: receivedMessages.length,
-        messages: receivedMessages.slice(0, limit)
-    });
+app.post(['/send_template_message', '/api/send_template_message'], async (req, res) => {
+    // Template messages fallback to regular text message
+    const to = req.body.to || req.body.recipient;
+    const text = req.body.text || req.body.message || 'Notification from AgenticOrg';
+
+    if (!sock || clientStatus !== 'READY') {
+        return res.status(503).json({ success: false, error: 'WhatsApp client is not ready' });
+    }
+
+    try {
+        const jid = to.includes('@s.whatsapp.net') ? to : `${to.replace(/[^0-9]/g, '')}@s.whatsapp.net`;
+        await sock.sendMessage(jid, { text: String(text) });
+        res.json({ success: true, status: 'sent' });
+    } catch (err) {
+        res.status(500).json({ success: false, error: err.message });
+    }
 });
 
 // ==================================================================
-// 🩺 Health Check & Ping (Keeps Render Awake 24/7)
+// 🩺 Standard Health Checks & Ping (Keeps Render Awake 24/7)
 // ==================================================================
-app.get('/health', (req, res) => {
+app.get(['/health', '/status'], (req, res) => {
     res.json({
         status: 'ok',
         whatsappStatus: clientStatus,
@@ -175,8 +228,7 @@ app.get('/', (req, res) => {
                 <body style="font-family: Arial, sans-serif; text-align: center; padding-top: 50px;">
                     <h2 style="color: #25D366;">✅ WhatsApp Connector is Online & Ready!</h2>
                     <p>Status: <strong>${clientStatus}</strong></p>
-                    <p>Base URL: <code>https://whatsapp-render-agent.onrender.com</code></p>
-                    <p>Available Endpoints: <code>POST /send-message</code>, <code>GET /last-message</code>, <code>GET /messages</code></p>
+                    <p>All 5 AgenticOrg tools registered and active.</p>
                 </body>
             </html>
         `);
