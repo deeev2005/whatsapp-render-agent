@@ -2,7 +2,6 @@ const express = require('express');
 const { default: makeWASocket, useMultiFileAuthState, DisconnectReason } = require('@whiskeysockets/baileys');
 const pino = require('pino');
 const QRCode = require('qrcode');
-const axios = require('axios');
 
 const app = express();
 app.use(express.json());
@@ -11,15 +10,8 @@ let currentQR = null;
 let clientStatus = 'STARTING';
 let sock = null;
 
-// ==================================================================
-// 🤖 AgenticOrg Virtual Employee Configuration (piiriya)
-// ==================================================================
-const AGENT_ID = process.env.AGENT_ID || 'abd04322-db21-4d01-a937-941ef9c68a30';
-const AGENTICORG_URL = `https://agenticorg.hackathon.pinelabs.com/api/v1/agents/${AGENT_ID}/run`;
-
-// Session credentials from your environment or defaults
-const AGENTICORG_SESSION = process.env.AGENTICORG_SESSION || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ2ZXJtYWRlZXBlc2gxNUBnbWFpbC5jb20iLCJhZ2VudGljb3JnOnRlbmFudF9pZCI6ImFiYjYxYmNhLWEzZjUtNGFiYS1iMzBlLTk0NjAxNmIxMzEyMCIsImFnZW50aWNvcmc6dXNlcl9pZCI6ImU1ZjA3MDU2LWYxNmEtNGExZC04YzFmLTY0ZTIzNTUyNGFhNyIsImdyYW50ZXg6c2NvcGVzIjpbImFnZW50czpyZWFkIiwiYWdlbnRzOndyaXRlIiwid29ya2Zsb3dzOnJlYWQiLCJ3b3JrZmxvd3M6d3JpdGUiLCJhdWRpdDpyZWFkIiwiY29ubmVjdG9yczpyZWFkIiwiY29ubmVjdG9yczpjcmVhdGUiLCJjb25uZWN0b3JzOnVwZGF0ZSIsImNvbm5lY3RvcnM6ZGVsZXRlIl0sIm5hbWUiOiJkZWVwZXNoIiwicm9sZSI6ImRldmVsb3BlciIsImRvbWFpbiI6ImJhY2tvZmZpY2UiLCJhZ2VudGljb3JnOmRvbWFpbnMiOlsiYmFja29mZmljZSJdLCJpc3MiOiJhZ2VudGljb3JnLWxvY2FsIiwiYXVkIjoiYWdlbnRpY29yZy10b29sLWdhdGV3YXkiLCJpYXQiOjE3OTA5NDMwNjYsImV4cCI6MTc5MDk0NjY2Nn0.sM7uEAHMpWIRdi3zW4pen6NbMD69LR3dlPP-bwcLIOY';
-const CSRF_TOKEN = process.env.CSRF_TOKEN || 'QJE9aot3_2sADzJaR4Rx2nKWsxqnJqyul7Lh-7dKhxM';
+// In-memory store for messages
+const receivedMessages = [];
 
 function getISTDate() {
     return new Date();
@@ -66,7 +58,6 @@ async function startWhatsApp() {
         }
     });
 
-    // Handle incoming WhatsApp messages
     sock.ev.on('messages.upsert', async ({ messages, type }) => {
         if (type !== 'notify') return;
 
@@ -81,58 +72,23 @@ async function startWhatsApp() {
             const isFromMe = msg.key.fromMe;
 
             if (!text) continue;
-            if (isFromMe && text.toLowerCase() !== '!ping') continue;
 
-            console.log(`📩 [WhatsApp Message from ${senderName} (${senderJid})]: ${text}`);
+            const record = {
+                id: msg.key.id,
+                sender: senderJid,
+                senderName: senderName,
+                text: text,
+                isFromMe: isFromMe,
+                timestamp: new Date().toISOString()
+            };
 
-            // 1. Built-in test ping
+            receivedMessages.unshift(record);
+            if (receivedMessages.length > 50) receivedMessages.pop();
+
+            console.log(`📩 [WhatsApp Message from ${senderName}]: ${text}`);
+
             if (text.toLowerCase() === '!ping') {
-                await sock.sendMessage(senderJid, { text: 'pong! 🏓 WhatsApp Agent piiriya is online and connected.' });
-                continue;
-            }
-
-            // 2. Call AgenticOrg Virtual Employee (piiriya)
-            try {
-                console.log(`🤖 Forwarding message to AgenticOrg Agent [${AGENT_ID}]...`);
-
-                const payload = {
-                    action: "run",
-                    csrf_token: CSRF_TOKEN,
-                    inputs: {
-                        task: text
-                    }
-                };
-
-                const response = await axios.post(AGENTICORG_URL, payload, {
-                    headers: {
-                        'Content-Type': 'application/json',
-                        'Accept': 'application/json, text/plain, */*',
-                        'x-csrf-token': CSRF_TOKEN,
-                        'Cookie': `agenticorg_session=${AGENTICORG_SESSION}; agenticorg_csrf=${CSRF_TOKEN}`,
-                        'Authorization': `Bearer ${AGENTICORG_SESSION}`,
-                        'Origin': 'https://agenticorg.hackathon.pinelabs.com',
-                        'Referer': `https://agenticorg.hackathon.pinelabs.com/dashboard/agents/${AGENT_ID}`
-                    },
-                    timeout: 45000
-                });
-
-                console.log('✅ AgenticOrg Response:', JSON.stringify(response.data, null, 2));
-
-                // Extract reply text from AgenticOrg response
-                const rawOutput = response.data?.output?.raw_output || response.data?.output?.response || response.data?.output;
-                const replyText = typeof rawOutput === 'object' ? JSON.stringify(rawOutput) : rawOutput;
-
-                if (replyText) {
-                    await sock.sendMessage(senderJid, { text: String(replyText) });
-                } else {
-                    await sock.sendMessage(senderJid, { text: 'Hello! I received your message, but the agent returned an empty response.' });
-                }
-
-            } catch (err) {
-                console.error('❌ Error executing AgenticOrg Agent:', err.response?.data || err.message);
-                await sock.sendMessage(senderJid, { 
-                    text: 'Sorry, I am having trouble connecting to the AgenticOrg AI engine right now.' 
-                });
+                await sock.sendMessage(senderJid, { text: 'pong! 🏓 WhatsApp MCP Server is running stably.' });
             }
         }
     });
@@ -141,18 +97,175 @@ async function startWhatsApp() {
 startWhatsApp();
 
 // ==================================================================
-// 🩺 Health Check & Ping (Keeps Render Awake 24/7)
+// 🔌 Model Context Protocol (MCP) & Tool Catalog Discovery
+// (AgenticOrg calls these endpoints during connector registration)
 // ==================================================================
-app.get('/health', (req, res) => {
+
+// Tool Definitions Catalog
+const toolsCatalog = [
+    {
+        name: "send_whatsapp_message",
+        description: "Sends an outbound WhatsApp message to a customer, merchant, or phone number.",
+        parameters: {
+            type: "object",
+            properties: {
+                to: {
+                    type: "string",
+                    description: "Phone number with country code (e.g. '919876543210' or '919876543210@s.whatsapp.net')"
+                },
+                message: {
+                    type: "string",
+                    description: "The text content of the message to send."
+                }
+            },
+            required: ["to", "message"]
+        }
+    },
+    {
+        name: "get_last_whatsapp_message",
+        description: "Retrieves the most recent incoming message received from a user on WhatsApp.",
+        parameters: {
+            type: "object",
+            properties: {
+                sender_filter: {
+                    type: "string",
+                    description: "Optional phone number filter"
+                }
+            }
+        }
+    },
+    {
+        name: "list_whatsapp_messages",
+        description: "Lists recent WhatsApp messages received by the agent.",
+        parameters: {
+            type: "object",
+            properties: {
+                limit: {
+                    type: "integer",
+                    description: "Number of messages to retrieve (default: 10)"
+                }
+            }
+        }
+    }
+];
+
+// 1. Tool Discovery Endpoints (MCP standard & OpenAPI formats)
+app.get(['/tools', '/api/tools', '/mcp/tools'], (req, res) => {
     res.json({
-        status: 'ok',
-        whatsappStatus: clientStatus,
-        agentId: AGENT_ID,
-        timeIST: getISTDate().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })
+        tools: toolsCatalog,
+        count: toolsCatalog.length
     });
 });
 
-app.get('/ping', (req, res) => res.status(200).send('OK'));
+// 2. Standard MCP JSON-RPC Endpoint (POST /mcp or POST /rpc)
+app.post(['/mcp', '/rpc'], async (req, res) => {
+    const { jsonrpc, method, params, id } = req.body;
+
+    // Handle MCP tools/list
+    if (method === 'tools/list') {
+        return res.json({
+            jsonrpc: "2.0",
+            result: { tools: toolsCatalog },
+            id: id || 1
+        });
+    }
+
+    // Handle MCP tools/call
+    if (method === 'tools/call') {
+        const toolName = params?.name;
+        const args = params?.arguments || {};
+
+        if (toolName === 'send_whatsapp_message') {
+            try {
+                const jid = args.to.includes('@s.whatsapp.net') ? args.to : `${args.to.replace(/[^0-9]/g, '')}@s.whatsapp.net`;
+                if (!sock || clientStatus !== 'READY') {
+                    throw new Error('WhatsApp client is not ready');
+                }
+                await sock.sendMessage(jid, { text: String(args.message) });
+                return res.json({
+                    jsonrpc: "2.0",
+                    result: { content: [{ type: "text", text: `Message sent successfully to ${jid}` }] },
+                    id: id || 1
+                });
+            } catch (err) {
+                return res.json({
+                    jsonrpc: "2.0",
+                    error: { code: -32000, message: err.message },
+                    id: id || 1
+                });
+            }
+        }
+
+        if (toolName === 'get_last_whatsapp_message') {
+            const latest = receivedMessages.find(m => !m.isFromMe) || null;
+            return res.json({
+                jsonrpc: "2.0",
+                result: { content: [{ type: "text", text: JSON.stringify(latest) }] },
+                id: id || 1
+            });
+        }
+    }
+
+    // Default response
+    res.json({ jsonrpc: "2.0", result: { status: "acknowledged" }, id: id || 1 });
+});
+
+// 3. REST Execution Endpoints (Direct tool invocation)
+app.post(['/execute', '/api/execute', '/call', '/api/call'], async (req, res) => {
+    const tool = req.body.tool || req.body.name;
+    const params = req.body.parameters || req.body.args || req.body;
+
+    if (tool === 'send_whatsapp_message' || req.path.includes('send')) {
+        const to = params.to || params.phone_number;
+        const message = params.message || params.text;
+
+        if (!to || !message) return res.status(400).json({ error: 'Missing to or message' });
+        if (!sock || clientStatus !== 'READY') return res.status(503).json({ error: 'WhatsApp not ready' });
+
+        try {
+            const jid = to.includes('@s.whatsapp.net') ? to : `${to.replace(/[^0-9]/g, '')}@s.whatsapp.net`;
+            await sock.sendMessage(jid, { text: String(message) });
+            return res.json({ success: true, message: `Sent to ${jid}` });
+        } catch (e) {
+            return res.status(500).json({ error: e.message });
+        }
+    }
+
+    if (tool === 'get_last_whatsapp_message') {
+        const latest = receivedMessages.find(m => !m.isFromMe) || null;
+        return res.json({ success: true, message: latest });
+    }
+
+    res.json({ success: true, tools: toolsCatalog });
+});
+
+// 4. Backward-compatible /send-message route
+app.post(['/send-message', '/api/send-message'], async (req, res) => {
+    const { to, message } = req.body;
+    if (!to || !message) return res.status(400).json({ error: 'Missing to or message' });
+    if (!sock || clientStatus !== 'READY') return res.status(503).json({ error: 'WhatsApp not ready' });
+
+    try {
+        const jid = to.includes('@s.whatsapp.net') ? to : `${to.replace(/[^0-9]/g, '')}@s.whatsapp.net`;
+        await sock.sendMessage(jid, { text: String(message) });
+        res.json({ success: true, status: 'sent' });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// ==================================================================
+// 🩺 Health Checks & Ping (Keeps Render Awake 24/7)
+// ==================================================================
+app.get(['/health', '/status', '/ping'], (req, res) => {
+    res.status(200).json({
+        status: 'ok',
+        whatsappStatus: clientStatus,
+        mcp: 'enabled',
+        tools: toolsCatalog.map(t => t.name),
+        timeIST: getISTDate().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })
+    });
+});
 
 // ==================================================================
 // 📱 Web Dashboard
@@ -162,10 +275,10 @@ app.get('/', (req, res) => {
         res.send(`
             <html>
                 <body style="font-family: Arial, sans-serif; text-align: center; padding-top: 50px;">
-                    <h2 style="color: #25D366;">✅ WhatsApp Virtual Employee (piiriya) is Online!</h2>
+                    <h2 style="color: #25D366;">✅ WhatsApp MCP Connector Server is Online!</h2>
                     <p>Status: <strong>${clientStatus}</strong></p>
-                    <p>Connected Agent ID: <code>${AGENT_ID}</code></p>
-                    <p>Send a message on WhatsApp to chat with piiriya!</p>
+                    <p>MCP Tool Catalog: <code>GET /tools</code></p>
+                    <p>MCP Endpoint: <code>POST /mcp</code></p>
                 </body>
             </html>
         `);
@@ -197,5 +310,5 @@ app.get('/', (req, res) => {
 // ==================================================================
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
-    console.log(`🚀 Server running on port ${PORT}`);
+    console.log(`🚀 WhatsApp MCP Connector Server running on port ${PORT}`);
 });
