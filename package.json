@@ -6,9 +6,10 @@
     "start": "node server.js"
   },
   "dependencies": {
+    "@whiskeysockets/baileys": "^6.7.16",
     "express": "^4.19.2",
     "qrcode": "^1.5.3",
-    "whatsapp-web.js": "^1.26.0",
-    "puppeteer": "^24.0.0"
+    "pino": "^9.4.0",
+    "axios": "^1.7.7"
   }
 }
