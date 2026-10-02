@@ -1,6 +1,6 @@
-FROM node:20-bullseye-slim
+FROM node:20-bookworm-slim
 
-# Install latest Chromium and required dependencies
+# Install latest Chromium and required dependencies from Debian Bookworm
 RUN apt-get update && apt-get install -y \
     chromium \
     fonts-ipafont-gothic \
@@ -12,7 +12,7 @@ RUN apt-get update && apt-get install -y \
     --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
-# Tell Puppeteer to use installed Chromium binary rather than downloading one
+# Tell Puppeteer to use the installed Chromium binary
 ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true \
     PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
 
@@ -26,4 +26,3 @@ COPY . .
 EXPOSE 3000
 
 CMD ["npm", "start"]
-
