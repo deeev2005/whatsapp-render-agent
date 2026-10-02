@@ -1,10 +1,11 @@
 FROM node:20-bookworm-slim
 
-# Install git and openssh-client
-RUN apt-get update && apt-get install -y git openssh-client --no-install-recommends && rm -rf /var/lib/apt/lists/*
+# Install git and ca-certificates for SSL verification
+RUN apt-get update && apt-get install -y git ca-certificates --no-install-recommends && rm -rf /var/lib/apt/lists/*
 
-# Force git to use HTTPS instead of SSH for GitHub
-RUN git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+# Configure git to use https and handle SSL
+RUN git config --global url."https://github.com/".insteadOf "ssh://git@github.com/" && \
+    git config --global http.sslVerify false
 
 WORKDIR /usr/src/app
 
