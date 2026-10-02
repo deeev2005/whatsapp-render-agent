@@ -7,7 +7,6 @@
   },
   "dependencies": {
     "@whiskeysockets/baileys": "^6.7.16",
-    "agenticorg-sdk": "^1.0.0",
     "axios": "^1.7.7",
     "express": "^4.19.2",
     "pino": "^9.4.0",
