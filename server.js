@@ -7,12 +7,18 @@ const crypto = require('crypto');
 const app = express();
 app.use(express.json());
 
-// Enable CORS for MCP Clients
+// Enable CORS for all MCP requests
 app.use((req, res, next) => {
     res.header('Access-Control-Allow-Origin', '*');
     res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-    res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, x-csrf-token');
+    res.header('Access-Control-Allow-Headers', '*');
     if (req.method === 'OPTIONS') return res.sendStatus(200);
+    next();
+});
+
+// Request logger
+app.use((req, res, next) => {
+    console.log(`📡 [MCP INCOMING] ${req.method} ${req.originalUrl}`);
     next();
 });
 
@@ -20,10 +26,7 @@ let currentQR = null;
 let clientStatus = 'STARTING';
 let sock = null;
 
-// In-memory store for messages
 const receivedMessages = [];
-
-// Active SSE client sessions
 const sseSessions = new Map();
 
 function getISTDate() {
@@ -82,26 +85,22 @@ async function startWhatsApp() {
 
             const text = msg.message.conversation || msg.message.extendedTextMessage?.text || '';
             const senderName = msg.pushName || 'User';
-            const isFromMe = msg.key.fromMe;
 
             if (!text) continue;
 
-            const record = {
+            receivedMessages.unshift({
                 id: msg.key.id,
                 sender: senderJid,
                 senderName: senderName,
                 text: text,
-                isFromMe: isFromMe,
                 timestamp: new Date().toISOString()
-            };
-
-            receivedMessages.unshift(record);
+            });
             if (receivedMessages.length > 50) receivedMessages.pop();
 
             console.log(`📩 [WhatsApp Message from ${senderName}]: ${text}`);
 
             if (text.toLowerCase() === '!ping') {
-                await sock.sendMessage(senderJid, { text: 'pong! 🏓 WhatsApp MCP Server is connected.' });
+                await sock.sendMessage(senderJid, { text: 'pong! 🏓 WhatsApp MCP Server is running stably.' });
             }
         }
     });
@@ -110,12 +109,12 @@ async function startWhatsApp() {
 startWhatsApp();
 
 // ==================================================================
-// 🛠️ MCP Tools Definition Catalog
+// 🛠️ MCP Tools Catalog
 // ==================================================================
 const mcpTools = [
     {
         name: "send_whatsapp_message",
-        description: "Sends an outbound WhatsApp text message to a user or merchant.",
+        description: "Sends an outbound WhatsApp text message to a user or phone number.",
         inputSchema: {
             type: "object",
             properties: {
@@ -133,7 +132,7 @@ const mcpTools = [
     },
     {
         name: "get_last_whatsapp_message",
-        description: "Gets the most recently received WhatsApp message.",
+        description: "Retrieves the most recent incoming WhatsApp message.",
         inputSchema: {
             type: "object",
             properties: {}
@@ -141,11 +140,10 @@ const mcpTools = [
     }
 ];
 
-// Helper to handle MCP JSON-RPC requests
+// MCP JSON-RPC Handler
 async function handleMcpRpc(request) {
     const { method, params, id } = request;
 
-    // 1. Initialize
     if (method === 'initialize') {
         return {
             jsonrpc: "2.0",
@@ -158,19 +156,17 @@ async function handleMcpRpc(request) {
                     }
                 },
                 serverInfo: {
-                    name: "whatsapp-mcp-server",
+                    name: "whatsapp_mcp_server",
                     version: "1.0.0"
                 }
             }
         };
     }
 
-    // 2. Initialized notification
     if (method === 'notifications/initialized') {
         return null;
     }
 
-    // 3. Tools list (Discovery)
     if (method === 'tools/list') {
         return {
             jsonrpc: "2.0",
@@ -181,7 +177,6 @@ async function handleMcpRpc(request) {
         };
     }
 
-    // 4. Tools call (Execution)
     if (method === 'tools/call') {
         const toolName = params?.name;
         const args = params?.arguments || {};
@@ -197,7 +192,7 @@ async function handleMcpRpc(request) {
                     jsonrpc: "2.0",
                     id,
                     result: {
-                        content: [{ type: "text", text: `Message sent successfully to ${jid}` }],
+                        content: [{ type: "text", text: `Message sent to ${jid}` }],
                         isError: false
                     }
                 };
@@ -206,7 +201,7 @@ async function handleMcpRpc(request) {
                     jsonrpc: "2.0",
                     id,
                     result: {
-                        content: [{ type: "text", text: `Failed to send: ${err.message}` }],
+                        content: [{ type: "text", text: `Error: ${err.message}` }],
                         isError: true
                     }
                 };
@@ -214,7 +209,7 @@ async function handleMcpRpc(request) {
         }
 
         if (toolName === 'get_last_whatsapp_message') {
-            const latest = receivedMessages.find(m => !m.isFromMe) || null;
+            const latest = receivedMessages[0] || null;
             return {
                 jsonrpc: "2.0",
                 id,
@@ -226,7 +221,6 @@ async function handleMcpRpc(request) {
         }
     }
 
-    // Fallback
     return {
         jsonrpc: "2.0",
         id,
@@ -235,14 +229,16 @@ async function handleMcpRpc(request) {
 }
 
 // ==================================================================
-// 📡 Official MCP SSE Transport Endpoints (GET /sse & POST /messages)
+// 📡 Official MCP SSE Transport
 // ==================================================================
+const RENDER_URL = process.env.RENDER_EXTERNAL_URL || 'https://whatsapp-render-agent.onrender.com';
 
-// 1. SSE Connection endpoint
-app.get(['/sse', '/mcp/sse'], (req, res) => {
+// 1. SSE Connection endpoint (Handles /sse, /mcp/sse, and /)
+app.get(['/sse', '/mcp/sse', '/mcp'], (req, res) => {
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache');
     res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no');
     res.flushHeaders();
 
     const sessionId = crypto.randomUUID();
@@ -250,10 +246,17 @@ app.get(['/sse', '/mcp/sse'], (req, res) => {
 
     console.log(`🔌 MCP SSE client connected: session ${sessionId}`);
 
-    // Send the mandatory MCP 'endpoint' event to tell client where to POST messages
-    res.write(`event: endpoint\ndata: /messages?sessionId=${sessionId}\n\n`);
+    // Send the absolute endpoint event required by Python MCP client
+    const endpointUrl = `${RENDER_URL}/messages?sessionId=${sessionId}`;
+    res.write(`event: endpoint\ndata: ${endpointUrl}\n\n`);
+
+    // Keep-alive heartbeat every 10 seconds
+    const heartbeat = setInterval(() => {
+        res.write(`: ping\n\n`);
+    }, 10000);
 
     req.on('close', () => {
+        clearInterval(heartbeat);
         console.log(`🔌 MCP SSE client disconnected: session ${sessionId}`);
         sseSessions.delete(sessionId);
     });
@@ -264,7 +267,7 @@ app.post(['/messages', '/mcp/messages'], async (req, res) => {
     const sessionId = req.query.sessionId;
     const body = req.body;
 
-    console.log(`📩 MCP Request [${body.method}]:`, JSON.stringify(body));
+    console.log(`📩 MCP Request:`, body?.method || body);
 
     const response = await handleMcpRpc(body);
 
@@ -275,18 +278,11 @@ app.post(['/messages', '/mcp/messages'], async (req, res) => {
         }
         res.status(202).send('Accepted');
     } else {
-        // Return JSON response directly if no active SSE stream
         res.json(response || { status: 'acknowledged' });
     }
 });
 
-// 3. Fallback direct JSON-RPC endpoint
-app.post(['/mcp', '/rpc'], async (req, res) => {
-    const response = await handleMcpRpc(req.body);
-    res.json(response || { status: 'acknowledged' });
-});
-
-// 4. Fallback REST tools endpoint
+// 3. Fallback direct tools listing
 app.get(['/tools', '/api/tools'], (req, res) => {
     res.json({ tools: mcpTools });
 });
@@ -298,7 +294,7 @@ app.get(['/health', '/status', '/ping'], (req, res) => {
     res.status(200).json({
         status: 'ok',
         whatsappStatus: clientStatus,
-        mcp: 'active',
+        mcp: 'ready',
         tools: mcpTools.map(t => t.name),
         timeIST: getISTDate().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })
     });
@@ -308,6 +304,11 @@ app.get(['/health', '/status', '/ping'], (req, res) => {
 // 📱 Web Dashboard
 // ==================================================================
 app.get('/', (req, res) => {
+    // If the client requested event-stream on root /, handle as SSE
+    if (req.headers.accept && req.headers.accept.includes('text/event-stream')) {
+        return res.redirect(307, '/sse');
+    }
+
     if (clientStatus === 'READY') {
         res.send(`
             <html>
@@ -315,7 +316,6 @@ app.get('/', (req, res) => {
                     <h2 style="color: #25D366;">✅ WhatsApp MCP Connector Server is Online!</h2>
                     <p>Status: <strong>${clientStatus}</strong></p>
                     <p>MCP SSE Endpoint: <code>/sse</code></p>
-                    <p>MCP Messages Endpoint: <code>/messages</code></p>
                 </body>
             </html>
         `);
