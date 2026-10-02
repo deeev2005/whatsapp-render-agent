@@ -3,11 +3,12 @@ const { default: makeWASocket, useMultiFileAuthState, DisconnectReason } = requi
 const pino = require('pino');
 const QRCode = require('qrcode');
 const crypto = require('crypto');
+const axios = require('axios');
 
 const app = express();
 app.use(express.json());
 
-// Enable CORS for all MCP requests
+// Enable CORS
 app.use((req, res, next) => {
     res.header('Access-Control-Allow-Origin', '*');
     res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
@@ -30,6 +31,12 @@ let sock = null;
 
 const receivedMessages = [];
 const sseSessions = new Map();
+
+// ==================================================================
+// 🤖 AgenticOrg Direct Agent Configuration (cvgfn)
+// ==================================================================
+const AGENT_ID = process.env.AGENT_ID || '7db40b4b-5493-485e-83bc-98f2093ea31c';
+const AGENTICORG_URL = `https://agenticorg.hackathon.pinelabs.com/api/v1/agents/${AGENT_ID}/run`;
 
 function getISTDate() {
     return new Date();
@@ -58,7 +65,7 @@ async function startWhatsApp() {
             QRCode.toDataURL(qr, (err, url) => {
                 if (!err) currentQR = url;
             });
-            console.log('📱 New QR code generated. Scan via: https://whatsapp-render-agent.onrender.com');
+            console.log('📱 New QR code generated. Scan via web page.');
         }
 
         if (connection === 'open') {
@@ -70,14 +77,14 @@ async function startWhatsApp() {
         if (connection === 'close') {
             const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
             clientStatus = 'DISCONNECTED';
-            console.log(`⚠️ WhatsApp Connection closed. Reconnecting: ${shouldReconnect}`);
+            console.log(`⚠️ Connection closed. Reconnecting: ${shouldReconnect}`);
             if (shouldReconnect) {
                 startWhatsApp();
             }
         }
     });
 
-    // 📩 Bulletproof Message Handler
+    // 📩 Listen to incoming WhatsApp messages & trigger cvgfn Agent
     sock.ev.on('messages.upsert', async (upsert) => {
         const messages = upsert.messages || [];
 
@@ -87,19 +94,16 @@ async function startWhatsApp() {
             const senderJid = msg.key.remoteJid;
             if (!senderJid || senderJid === 'status@broadcast') continue;
 
-            // Extract message text across all possible WhatsApp message structures
             const text = 
                 msg.message.conversation || 
                 msg.message.extendedTextMessage?.text || 
                 msg.message.imageMessage?.caption ||
-                msg.message.videoMessage?.caption ||
-                msg.message.documentMessage?.caption ||
                 '';
 
             const senderName = msg.pushName || 'User';
+            const cleanNumber = senderJid.replace(/[^0-9]/g, '');
 
-            // Print every incoming message to Render logs
-            console.log(`📩 [WhatsApp RAW] From: ${senderJid} (${senderName}) | Text: "${text}"`);
+            console.log(`📩 [WhatsApp Incoming] From ${cleanNumber} (${senderName}): "${text}"`);
 
             if (!text) continue;
 
@@ -113,24 +117,40 @@ async function startWhatsApp() {
             receivedMessages.unshift(record);
             if (receivedMessages.length > 50) receivedMessages.pop();
 
-            // 🏓 Handle !ping command (handles '!ping', '!ping ', case-insensitive)
+            // 1. Built-in test !ping
             if (text.toLowerCase().trim() === '!ping') {
-                try {
-                    console.log(`🏓 Triggering pong reply to ${senderJid}...`);
-                    await sock.sendMessage(senderJid, { 
-                        text: 'pong! 🏓 WhatsApp Connector is active and connected.' 
-                    }, { quoted: msg });
-                    console.log(`✅ Pong reply successfully delivered to ${senderJid}`);
-                } catch (replyErr) {
-                    console.error('❌ Error delivering pong reply with quote, trying unquoted:', replyErr.message);
-                    try {
-                        await sock.sendMessage(senderJid, { 
-                            text: 'pong! 🏓 WhatsApp Connector is active and connected.' 
-                        });
-                    } catch (fallbackErr) {
-                        console.error('❌ Fatal error sending pong:', fallbackErr.message);
+                await sock.sendMessage(senderJid, { text: 'pong! 🏓 WhatsApp MCP Server is connected.' }, { quoted: msg });
+                continue;
+            }
+
+            // 2. Trigger the AgenticOrg Agent directly!
+            try {
+                console.log(`🤖 Triggering Agent [${AGENT_ID}] with user question...`);
+
+                const payload = {
+                    action: "run",
+                    inputs: {
+                        task: `Customer (${cleanNumber}) sent this message: "${text}". Please answer their inquiry and send the reply back to WhatsApp number ${cleanNumber} using your send_whatsapp_message tool.`
                     }
+                };
+
+                const response = await axios.post(AGENTICORG_URL, payload, {
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    timeout: 45000
+                });
+
+                console.log('✅ AgenticOrg Agent Response:', response.data);
+
+                // If the agent replied with text instead of calling tool, send it directly as fallback
+                const rawOutput = response.data?.output?.raw_output || response.data?.output?.response;
+                if (rawOutput && typeof rawOutput === 'string') {
+                    await sock.sendMessage(senderJid, { text: rawOutput });
                 }
+
+            } catch (err) {
+                console.error('❌ Error triggering Agent directly:', err.response?.data || err.message);
             }
         }
     });
@@ -139,7 +159,7 @@ async function startWhatsApp() {
 startWhatsApp();
 
 // ==================================================================
-// 🛠️ MCP Tools Catalog (All 7 Tools Explicitly Registered)
+// 🛠️ MCP Tools Catalog
 // ==================================================================
 const mcpTools = [
     {
@@ -148,32 +168,20 @@ const mcpTools = [
         inputSchema: {
             type: "object",
             properties: {
-                to: {
-                    type: "string",
-                    description: "Phone number with country code (e.g. 919876543210 or 919876543210@s.whatsapp.net)"
-                },
-                message: {
-                    type: "string",
-                    description: "The text message content to send"
-                }
+                to: { type: "string", description: "Phone number with country code" },
+                message: { type: "string", description: "The text message content to send" }
             },
             required: ["to", "message"]
         }
     },
     {
         name: "send_whatsapp_message",
-        description: "Alias for sending a WhatsApp message to a phone number.",
+        description: "Sends a WhatsApp message to a phone number.",
         inputSchema: {
             type: "object",
             properties: {
-                to: {
-                    type: "string",
-                    description: "Phone number with country code (e.g. 919876543210)"
-                },
-                message: {
-                    type: "string",
-                    description: "The text message content to send"
-                }
+                to: { type: "string", description: "Phone number with country code" },
+                message: { type: "string", description: "The text message content to send" }
             },
             required: ["to", "message"]
         }
@@ -181,58 +189,14 @@ const mcpTools = [
     {
         name: "get_last_whatsapp_message",
         description: "Retrieves the most recent incoming message received from a user on WhatsApp.",
-        inputSchema: {
-            type: "object",
-            properties: {}
-        }
-    },
-    {
-        name: "get_business_profile",
-        description: "Gets the WhatsApp business profile and health status.",
-        inputSchema: {
-            type: "object",
-            properties: {}
-        }
-    },
-    {
-        name: "get_message_templates",
-        description: "Retrieves message templates available for WhatsApp.",
-        inputSchema: {
-            type: "object",
-            properties: {}
-        }
-    },
-    {
-        name: "send_media_message",
-        description: "Sends a media message (image/document) via WhatsApp.",
-        inputSchema: {
-            type: "object",
-            properties: {
-                to: { type: "string" },
-                media_url: { type: "string" },
-                caption: { type: "string" }
-            },
-            required: ["to"]
-        }
-    },
-    {
-        name: "send_template_message",
-        description: "Sends a template notification message via WhatsApp.",
-        inputSchema: {
-            type: "object",
-            properties: {
-                to: { type: "string" },
-                text: { type: "string" }
-            },
-            required: ["to"]
-        }
+        inputSchema: { type: "object", properties: {} }
     }
 ];
 
 // Core function to send WhatsApp messages
 async function sendWhatsApp(to, message) {
     if (!sock || clientStatus !== 'READY') {
-        throw new Error('WhatsApp is not connected yet. Please visit the web page and check QR code.');
+        throw new Error('WhatsApp is not connected yet.');
     }
     const cleanNumber = String(to).replace(/[^0-9]/g, '');
     const jid = to.includes('@s.whatsapp.net') ? to : `${cleanNumber}@s.whatsapp.net`;
@@ -252,17 +216,12 @@ async function handleMcpRpc(request) {
             result: {
                 protocolVersion: "2024-11-05",
                 capabilities: { tools: { listChanged: false } },
-                serverInfo: {
-                    name: "whatsapp_mcp_server",
-                    version: "1.0.0"
-                }
+                serverInfo: { name: "whatsapp_mcp_server", version: "1.0.0" }
             }
         };
     }
 
-    if (method === 'notifications/initialized') {
-        return null;
-    }
+    if (method === 'notifications/initialized') return null;
 
     if (method === 'tools/list') {
         return {
@@ -278,20 +237,9 @@ async function handleMcpRpc(request) {
 
         console.log(`⚡ [MCP TOOL CALL] ${toolName} with args:`, JSON.stringify(args));
 
-        if (toolName === 'send_text_message' || toolName === 'send_whatsapp_message' || toolName === 'send_template_message') {
-            const to = args.to || args.recipient || args.phone_number || args.recipient_id;
+        if (toolName === 'send_text_message' || toolName === 'send_whatsapp_message') {
+            const to = args.to || args.recipient || args.phone_number;
             const message = args.message || args.text || args.body;
-
-            if (!to || !message) {
-                return {
-                    jsonrpc: "2.0",
-                    id,
-                    result: {
-                        content: [{ type: "text", text: "Error: Both 'to' and 'message' parameters are required." }],
-                        isError: true
-                    }
-                };
-            }
 
             try {
                 const jid = await sendWhatsApp(to, message);
@@ -308,7 +256,7 @@ async function handleMcpRpc(request) {
                     jsonrpc: "2.0",
                     id,
                     result: {
-                        content: [{ type: "text", text: `Failed to deliver WhatsApp message: ${err.message}` }],
+                        content: [{ type: "text", text: `Error: ${err.message}` }],
                         isError: true
                     }
                 };
@@ -325,53 +273,6 @@ async function handleMcpRpc(request) {
                     isError: false
                 }
             };
-        }
-
-        if (toolName === 'get_business_profile') {
-            return {
-                jsonrpc: "2.0",
-                id,
-                result: {
-                    content: [{ type: "text", text: JSON.stringify({ name: "WhatsApp Agent", status: clientStatus }) }],
-                    isError: false
-                }
-            };
-        }
-
-        if (toolName === 'get_message_templates') {
-            return {
-                jsonrpc: "2.0",
-                id,
-                result: {
-                    content: [{ type: "text", text: JSON.stringify([{ name: "general_reply", language: "en" }]) }],
-                    isError: false
-                }
-            };
-        }
-
-        if (toolName === 'send_media_message') {
-            try {
-                const to = args.to || args.recipient;
-                const caption = args.caption || args.text || '';
-                const jid = await sendWhatsApp(to, caption);
-                return {
-                    jsonrpc: "2.0",
-                    id,
-                    result: {
-                        content: [{ type: "text", text: `Media message sent to ${jid}` }],
-                        isError: false
-                    }
-                };
-            } catch (err) {
-                return {
-                    jsonrpc: "2.0",
-                    id,
-                    result: {
-                        content: [{ type: "text", text: err.message }],
-                        isError: true
-                    }
-                };
-            }
         }
     }
 
@@ -464,9 +365,10 @@ app.get('/', (req, res) => {
         res.send(`
             <html>
                 <body style="font-family: Arial, sans-serif; text-align: center; padding-top: 50px;">
-                    <h2 style="color: #25D366;">✅ WhatsApp MCP Connector Server is Online!</h2>
+                    <h2 style="color: #25D366;">✅ WhatsApp AI Agent Bridge is Online!</h2>
                     <p>Status: <strong>${clientStatus}</strong></p>
-                    <p>All 7 MCP Tools Active & Registered.</p>
+                    <p>Connected to Agent: <code>${AGENT_ID}</code></p>
+                    <p>Send any message on WhatsApp to chat with the agent!</p>
                 </body>
             </html>
         `);
@@ -498,5 +400,5 @@ app.get('/', (req, res) => {
 // ==================================================================
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
-    console.log(`🚀 Server started on port ${PORT}`);
+    console.log(`🚀 Server running on port ${PORT}`);
 });
