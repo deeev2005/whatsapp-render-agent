@@ -44,7 +44,8 @@ async function startWhatsApp() {
     sock = makeWASocket({
         auth: state,
         logger: pino({ level: 'silent' }),
-        printQRInTerminal: false
+        printQRInTerminal: false,
+        syncFullHistory: false
     });
 
     sock.ev.on('creds.update', saveCreds);
@@ -57,41 +58,48 @@ async function startWhatsApp() {
             QRCode.toDataURL(qr, (err, url) => {
                 if (!err) currentQR = url;
             });
-            console.log('📱 New QR code generated. Visit web page to scan.');
+            console.log('📱 New QR code generated. Scan via: https://whatsapp-render-agent.onrender.com');
         }
 
         if (connection === 'open') {
             clientStatus = 'READY';
             currentQR = null;
-            console.log('✅ WhatsApp Agent is ONLINE and READY!');
+            console.log('✅ WhatsApp Agent is ONLINE and READY to receive/send messages!');
         }
 
         if (connection === 'close') {
             const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
             clientStatus = 'DISCONNECTED';
-            console.log(`⚠️ Connection closed. Reconnecting: ${shouldReconnect}`);
+            console.log(`⚠️ WhatsApp Connection closed. Reconnecting: ${shouldReconnect}`);
             if (shouldReconnect) {
                 startWhatsApp();
             }
         }
     });
 
-    sock.ev.on('messages.upsert', async ({ messages, type }) => {
-        if (type !== 'notify') return;
+    // 📩 Bulletproof Message Handler
+    sock.ev.on('messages.upsert', async (upsert) => {
+        const messages = upsert.messages || [];
 
         for (const msg of messages) {
             if (!msg.message) continue;
 
             const senderJid = msg.key.remoteJid;
-            if (senderJid === 'status@broadcast') continue;
+            if (!senderJid || senderJid === 'status@broadcast') continue;
 
+            // Extract message text across all possible WhatsApp message structures
             const text = 
                 msg.message.conversation || 
                 msg.message.extendedTextMessage?.text || 
                 msg.message.imageMessage?.caption ||
+                msg.message.videoMessage?.caption ||
+                msg.message.documentMessage?.caption ||
                 '';
 
             const senderName = msg.pushName || 'User';
+
+            // Print every incoming message to Render logs
+            console.log(`📩 [WhatsApp RAW] From: ${senderJid} (${senderName}) | Text: "${text}"`);
 
             if (!text) continue;
 
@@ -105,10 +113,24 @@ async function startWhatsApp() {
             receivedMessages.unshift(record);
             if (receivedMessages.length > 50) receivedMessages.pop();
 
-            console.log(`📩 [WhatsApp Message from ${senderName}]: ${text}`);
-
+            // 🏓 Handle !ping command (handles '!ping', '!ping ', case-insensitive)
             if (text.toLowerCase().trim() === '!ping') {
-                await sock.sendMessage(senderJid, { text: 'pong! 🏓 WhatsApp MCP Server is running stably.' });
+                try {
+                    console.log(`🏓 Triggering pong reply to ${senderJid}...`);
+                    await sock.sendMessage(senderJid, { 
+                        text: 'pong! 🏓 WhatsApp Connector is active and connected.' 
+                    }, { quoted: msg });
+                    console.log(`✅ Pong reply successfully delivered to ${senderJid}`);
+                } catch (replyErr) {
+                    console.error('❌ Error delivering pong reply with quote, trying unquoted:', replyErr.message);
+                    try {
+                        await sock.sendMessage(senderJid, { 
+                            text: 'pong! 🏓 WhatsApp Connector is active and connected.' 
+                        });
+                    } catch (fallbackErr) {
+                        console.error('❌ Fatal error sending pong:', fallbackErr.message);
+                    }
+                }
             }
         }
     });
@@ -210,7 +232,7 @@ const mcpTools = [
 // Core function to send WhatsApp messages
 async function sendWhatsApp(to, message) {
     if (!sock || clientStatus !== 'READY') {
-        throw new Error('WhatsApp is not connected yet. Please wait for the client to be ready.');
+        throw new Error('WhatsApp is not connected yet. Please visit the web page and check QR code.');
     }
     const cleanNumber = String(to).replace(/[^0-9]/g, '');
     const jid = to.includes('@s.whatsapp.net') ? to : `${cleanNumber}@s.whatsapp.net`;
@@ -256,7 +278,6 @@ async function handleMcpRpc(request) {
 
         console.log(`⚡ [MCP TOOL CALL] ${toolName} with args:`, JSON.stringify(args));
 
-        // Handle both send_text_message AND send_whatsapp_message
         if (toolName === 'send_text_message' || toolName === 'send_whatsapp_message' || toolName === 'send_template_message') {
             const to = args.to || args.recipient || args.phone_number || args.recipient_id;
             const message = args.message || args.text || args.body;
@@ -477,5 +498,5 @@ app.get('/', (req, res) => {
 // ==================================================================
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
-    console.log(`🚀 Server running on port ${PORT}`);
+    console.log(`🚀 Server started on port ${PORT}`);
 });
