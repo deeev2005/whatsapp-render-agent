@@ -33,13 +33,34 @@ const receivedMessages = [];
 const sseSessions = new Map();
 
 // ==================================================================
-// 🤖 AgenticOrg Direct Agent Configuration (cvgfn)
+// 🤖 AgenticOrg Virtual Employee Configuration (cvgfn)
 // ==================================================================
 const AGENT_ID = process.env.AGENT_ID || '7db40b4b-5493-485e-83bc-98f2093ea31c';
 const AGENTICORG_URL = `https://agenticorg.hackathon.pinelabs.com/api/v1/agents/${AGENT_ID}/run`;
 
 function getISTDate() {
     return new Date();
+}
+
+// 🔍 Universal Text Extractor (Unwraps ephemeral, view-once, and extended texts)
+function extractMessageText(message) {
+    if (!message) return '';
+    
+    if (message.ephemeralMessage) message = message.ephemeralMessage.message;
+    if (message.viewOnceMessage) message = message.viewOnceMessage.message;
+    if (message.viewOnceMessageV2) message = message.viewOnceMessageV2.message;
+
+    return (
+        message.conversation ||
+        message.extendedTextMessage?.text ||
+        message.imageMessage?.caption ||
+        message.videoMessage?.caption ||
+        message.documentMessage?.caption ||
+        message.buttonsResponseMessage?.selectedButtonId ||
+        message.listResponseMessage?.singleSelectReply?.selectedRowId ||
+        message.templateButtonReplyMessage?.selectedId ||
+        ''
+    );
 }
 
 // ==================================================================
@@ -94,16 +115,11 @@ async function startWhatsApp() {
             const senderJid = msg.key.remoteJid;
             if (!senderJid || senderJid === 'status@broadcast') continue;
 
-            const text = 
-                msg.message.conversation || 
-                msg.message.extendedTextMessage?.text || 
-                msg.message.imageMessage?.caption ||
-                '';
-
+            // Extract the real text using the universal extractor
+            const text = extractMessageText(msg.message);
             const senderName = msg.pushName || 'User';
-            const cleanNumber = senderJid.replace(/[^0-9]/g, '');
 
-            console.log(`📩 [WhatsApp Incoming] From ${cleanNumber} (${senderName}): "${text}"`);
+            console.log(`📩 [WhatsApp Incoming] From: ${senderJid} (${senderName}) | Text: "${text}"`);
 
             if (!text) continue;
 
@@ -117,33 +133,32 @@ async function startWhatsApp() {
             receivedMessages.unshift(record);
             if (receivedMessages.length > 50) receivedMessages.pop();
 
-            // 1. Built-in test !ping
+            // 1. Built-in test ping
             if (text.toLowerCase().trim() === '!ping') {
-                await sock.sendMessage(senderJid, { text: 'pong! 🏓 WhatsApp MCP Server is connected.' }, { quoted: msg });
+                console.log(`🏓 Sending pong to ${senderJid}...`);
+                await sock.sendMessage(senderJid, { text: 'pong! 🏓 WhatsApp MCP Server is connected.' });
                 continue;
             }
 
             // 2. Trigger the AgenticOrg Agent directly!
             try {
-                console.log(`🤖 Triggering Agent [${AGENT_ID}] with user question...`);
+                console.log(`🤖 Triggering Agent [${AGENT_ID}] with text: "${text}"...`);
 
                 const payload = {
                     action: "run",
                     inputs: {
-                        task: `Customer (${cleanNumber}) sent this message: "${text}". Please answer their inquiry and send the reply back to WhatsApp number ${cleanNumber} using your send_whatsapp_message tool.`
+                        task: `Customer (${senderName}) sent this inquiry: "${text}". Answer their question and send the reply back to ${senderJid} using your send_whatsapp_message tool.`
                     }
                 };
 
                 const response = await axios.post(AGENTICORG_URL, payload, {
-                    headers: {
-                        'Content-Type': 'application/json'
-                    },
+                    headers: { 'Content-Type': 'application/json' },
                     timeout: 45000
                 });
 
-                console.log('✅ AgenticOrg Agent Response:', response.data);
+                console.log('✅ AgenticOrg Agent executed successfully!');
 
-                // If the agent replied with text instead of calling tool, send it directly as fallback
+                // If agent returned text directly instead of tool call, send it as reply
                 const rawOutput = response.data?.output?.raw_output || response.data?.output?.response;
                 if (rawOutput && typeof rawOutput === 'string') {
                     await sock.sendMessage(senderJid, { text: rawOutput });
@@ -198,8 +213,11 @@ async function sendWhatsApp(to, message) {
     if (!sock || clientStatus !== 'READY') {
         throw new Error('WhatsApp is not connected yet.');
     }
-    const cleanNumber = String(to).replace(/[^0-9]/g, '');
-    const jid = to.includes('@s.whatsapp.net') ? to : `${cleanNumber}@s.whatsapp.net`;
+    let jid = to;
+    if (!to.includes('@')) {
+        const cleanNumber = String(to).replace(/[^0-9]/g, '');
+        jid = `${cleanNumber}@s.whatsapp.net`;
+    }
     await sock.sendMessage(jid, { text: String(message) });
     console.log(`📤 Successfully sent WhatsApp message to ${jid}: "${message}"`);
     return jid;
