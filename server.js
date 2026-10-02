@@ -2,7 +2,12 @@ const express = require('express');
 const { default: makeWASocket, useMultiFileAuthState, DisconnectReason } = require('@whiskeysockets/baileys');
 const pino = require('pino');
 const QRCode = require('qrcode');
-const axios = require('axios');
+let AgenticOrg;
+try {
+    AgenticOrg = require('agenticorg-sdk').AgenticOrg;
+} catch (e) {
+    AgenticOrg = null;
+}
 
 const app = express();
 app.use(express.json());
@@ -11,28 +16,40 @@ let currentQR = null;
 let clientStatus = 'STARTING';
 let sock = null;
 
-// Replace this with your actual external API URL (or leave blank for !ping test)
-const EXTERNAL_API_URL = process.env.EXTERNAL_API_URL || ''; 
+// ==================================================================
+// 🔑 AgenticOrg Configuration
+// ==================================================================
+const AGENTICORG_API_KEY = process.env.AGENTICORG_API_KEY || '';
+// The agent type or workflow you created in the platform (e.g., 'chat_agent', 'support_triage', 'ap_processor')
+const AGENT_TYPE = process.env.AGENT_TYPE || 'chat_agent';
+
+let aiClient = null;
+if (AgenticOrg && AGENTICORG_API_KEY) {
+    aiClient = new AgenticOrg({ apiKey: AGENTICORG_API_KEY });
+    console.log(`🤖 AgenticOrg client initialized for agent: ${AGENT_TYPE}`);
+} else {
+    console.log('⚠️ AgenticOrg API Key not set. Running in echo/ping mode.');
+}
 
 // Helper function for IST Date
 function getISTDate() {
     return new Date();
 }
 
+// ==================================================================
+// 📱 WhatsApp Engine (Baileys)
+// ==================================================================
 async function startWhatsApp() {
-    // Saves auth session in ./baileys_auth folder
     const { state, saveCreds } = await useMultiFileAuthState('./baileys_auth');
 
     sock = makeWASocket({
         auth: state,
-        logger: pino({ level: 'silent' }), // suppress verbose logs
+        logger: pino({ level: 'silent' }),
         printQRInTerminal: false
     });
 
-    // Save session credentials whenever updated
     sock.ev.on('creds.update', saveCreds);
 
-    // Connection events (QR, Connected, Disconnected)
     sock.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect, qr } = update;
 
@@ -47,7 +64,7 @@ async function startWhatsApp() {
         if (connection === 'open') {
             clientStatus = 'READY';
             currentQR = null;
-            console.log('✅ WhatsApp Agent is ONLINE and READY! (Baileys - ~40MB RAM)');
+            console.log('✅ WhatsApp Agent is ONLINE and READY!');
         }
 
         if (connection === 'close') {
@@ -60,7 +77,7 @@ async function startWhatsApp() {
         }
     });
 
-    // Listen to messages (Incoming and Self)
+    // Handle Incoming WhatsApp Messages
     sock.ev.on('messages.upsert', async ({ messages, type }) => {
         if (type !== 'notify') return;
 
@@ -70,36 +87,53 @@ async function startWhatsApp() {
             const senderJid = msg.key.remoteJid;
             if (senderJid === 'status@broadcast') continue;
 
-            // Extract message text (handles standard text and extended text)
+            // Extract message body
             const text = msg.message.conversation || msg.message.extendedTextMessage?.text || '';
             const isFromMe = msg.key.fromMe;
+            const senderName = msg.pushName || 'User';
 
-            console.log(`[Message from ${senderJid}]: ${text}`);
+            // Ignore empty messages or our own messages (unless testing with !ping)
+            if (!text) continue;
+            if (isFromMe && text.toLowerCase() !== '!ping') continue;
 
-            // 1. Built-in test command !ping
+            console.log(`[Message from ${senderName} (${senderJid})]: ${text}`);
+
+            // 1. Quick test command !ping
             if (text.toLowerCase() === '!ping') {
-                await sock.sendMessage(senderJid, { text: 'pong! 🏓 Agent is running stably on Baileys (RAM: ~45MB)!' });
+                await sock.sendMessage(senderJid, { text: 'pong! 🏓 AgenticOrg WhatsApp bridge is active.' });
                 continue;
             }
 
-            // 2. Forward to your external API (if URL is configured)
-            if (EXTERNAL_API_URL && text && !isFromMe) {
+            // 2. Process with AgenticOrg Virtual Employee / Workflow
+            if (aiClient) {
                 try {
-                    console.log(`Forwarding message to ${EXTERNAL_API_URL}...`);
-                    const apiResponse = await axios.post(EXTERNAL_API_URL, {
-                        sender: senderJid,
-                        senderName: msg.pushName || 'User',
-                        messageText: text,
-                        timestamp: msg.messageTimestamp
-                    }, { timeout: 30000 });
+                    console.log(`🤖 Forwarding message to AgenticOrg Agent [${AGENT_TYPE}]...`);
 
-                    const replyText = apiResponse.data?.reply || apiResponse.data?.message || apiResponse.data;
-                    if (replyText) {
-                        await sock.sendMessage(senderJid, { text: String(replyText) });
+                    // Run the agent. This automatically saves the execution, memory, and outputs into your platform!
+                    const runResult = await aiClient.agents.run(AGENT_TYPE, {
+                        inputs: {
+                            sender_id: senderJid,
+                            sender_name: senderName,
+                            message: text,
+                            timestamp: msg.messageTimestamp ? String(msg.messageTimestamp) : String(Date.now())
+                        }
+                    });
+
+                    console.log('AgenticOrg output:', runResult);
+
+                    // Extract the reply generated by the agent
+                    const agentReply = runResult.output?.reply || runResult.output?.response || runResult.output || runResult.response;
+
+                    if (agentReply) {
+                        const replyString = typeof agentReply === 'object' ? JSON.stringify(agentReply, null, 2) : String(agentReply);
+                        await sock.sendMessage(senderJid, { text: replyString });
                     }
                 } catch (err) {
-                    console.error('External API error:', err.message);
+                    console.error('❌ Error executing AgenticOrg Agent:', err.message || err);
+                    await sock.sendMessage(senderJid, { text: 'Sorry, I encountered an issue processing your request.' });
                 }
+            } else {
+                console.log('ℹ️ AgenticOrg API Key not configured in environment variables.');
             }
         }
     });
@@ -114,6 +148,7 @@ app.get('/health', (req, res) => {
     res.json({
         status: 'ok',
         whatsappStatus: clientStatus,
+        agenticOrgConfigured: Boolean(aiClient),
         timeIST: getISTDate().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })
     });
 });
@@ -121,7 +156,7 @@ app.get('/health', (req, res) => {
 app.get('/ping', (req, res) => res.status(200).send('OK'));
 
 // ==================================================================
-// 📱 Web Dashboard
+// 📱 Web Dashboard (Shows QR & Status)
 // ==================================================================
 app.get('/', (req, res) => {
     if (clientStatus === 'READY') {
@@ -129,9 +164,9 @@ app.get('/', (req, res) => {
             <html>
                 <body style="font-family: Arial, sans-serif; text-align: center; padding-top: 50px;">
                     <h2 style="color: #25D366;">✅ WhatsApp Agent is Online & Connected!</h2>
-                    <p>Engine: <strong>Baileys (Ultra Low RAM ~45MB)</strong></p>
+                    <p>Connected to AgenticOrg Agent: <strong>${AGENT_TYPE}</strong></p>
                     <p>Status: <strong>${clientStatus}</strong></p>
-                    <p>Send <code>!ping</code> on WhatsApp to test.</p>
+                    <p>Send a message on WhatsApp to interact with your Virtual Employee.</p>
                 </body>
             </html>
         `);
@@ -159,7 +194,7 @@ app.get('/', (req, res) => {
 });
 
 // ==================================================================
-// 🚀 Outbound API endpoint to send WhatsApp message from external servers
+// 🚀 Outbound API: Trigger WhatsApp messages from your platform
 // ==================================================================
 app.post('/api/send-message', async (req, res) => {
     const { to, message } = req.body;
@@ -173,7 +208,7 @@ app.post('/api/send-message', async (req, res) => {
     try {
         const jid = to.includes('@s.whatsapp.net') ? to : `${to.replace(/[^0-9]/g, '')}@s.whatsapp.net`;
         await sock.sendMessage(jid, { text: message });
-        res.json({ success: true, message: 'Sent successfully' });
+        res.json({ success: true, message: 'Message sent successfully' });
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
@@ -185,6 +220,5 @@ app.post('/api/send-message', async (req, res) => {
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
     console.log('🚀 Server started...');
-    console.log('👂 Monitoring notification collection for new entries...');
     console.log(`✅ Server running on port ${PORT}`);
 });
