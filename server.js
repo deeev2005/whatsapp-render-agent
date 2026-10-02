@@ -2,9 +2,19 @@ const express = require('express');
 const { default: makeWASocket, useMultiFileAuthState, DisconnectReason } = require('@whiskeysockets/baileys');
 const pino = require('pino');
 const QRCode = require('qrcode');
+const crypto = require('crypto');
 
 const app = express();
 app.use(express.json());
+
+// Enable CORS for MCP Clients
+app.use((req, res, next) => {
+    res.header('Access-Control-Allow-Origin', '*');
+    res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, x-csrf-token');
+    if (req.method === 'OPTIONS') return res.sendStatus(200);
+    next();
+});
 
 let currentQR = null;
 let clientStatus = 'STARTING';
@@ -12,6 +22,9 @@ let sock = null;
 
 // In-memory store for messages
 const receivedMessages = [];
+
+// Active SSE client sessions
+const sseSessions = new Map();
 
 function getISTDate() {
     return new Date();
@@ -88,7 +101,7 @@ async function startWhatsApp() {
             console.log(`📩 [WhatsApp Message from ${senderName}]: ${text}`);
 
             if (text.toLowerCase() === '!ping') {
-                await sock.sendMessage(senderJid, { text: 'pong! 🏓 WhatsApp MCP Server is running stably.' });
+                await sock.sendMessage(senderJid, { text: 'pong! 🏓 WhatsApp MCP Server is connected.' });
             }
         }
     });
@@ -97,25 +110,22 @@ async function startWhatsApp() {
 startWhatsApp();
 
 // ==================================================================
-// 🔌 Model Context Protocol (MCP) & Tool Catalog Discovery
-// (AgenticOrg calls these endpoints during connector registration)
+// 🛠️ MCP Tools Definition Catalog
 // ==================================================================
-
-// Tool Definitions Catalog
-const toolsCatalog = [
+const mcpTools = [
     {
         name: "send_whatsapp_message",
-        description: "Sends an outbound WhatsApp message to a customer, merchant, or phone number.",
-        parameters: {
+        description: "Sends an outbound WhatsApp text message to a user or merchant.",
+        inputSchema: {
             type: "object",
             properties: {
                 to: {
                     type: "string",
-                    description: "Phone number with country code (e.g. '919876543210' or '919876543210@s.whatsapp.net')"
+                    description: "Phone number with country code (e.g. 919876543210)"
                 },
                 message: {
                     type: "string",
-                    description: "The text content of the message to send."
+                    description: "The text message to send"
                 }
             },
             required: ["to", "message"]
@@ -123,54 +133,55 @@ const toolsCatalog = [
     },
     {
         name: "get_last_whatsapp_message",
-        description: "Retrieves the most recent incoming message received from a user on WhatsApp.",
-        parameters: {
+        description: "Gets the most recently received WhatsApp message.",
+        inputSchema: {
             type: "object",
-            properties: {
-                sender_filter: {
-                    type: "string",
-                    description: "Optional phone number filter"
-                }
-            }
-        }
-    },
-    {
-        name: "list_whatsapp_messages",
-        description: "Lists recent WhatsApp messages received by the agent.",
-        parameters: {
-            type: "object",
-            properties: {
-                limit: {
-                    type: "integer",
-                    description: "Number of messages to retrieve (default: 10)"
-                }
-            }
+            properties: {}
         }
     }
 ];
 
-// 1. Tool Discovery Endpoints (MCP standard & OpenAPI formats)
-app.get(['/tools', '/api/tools', '/mcp/tools'], (req, res) => {
-    res.json({
-        tools: toolsCatalog,
-        count: toolsCatalog.length
-    });
-});
+// Helper to handle MCP JSON-RPC requests
+async function handleMcpRpc(request) {
+    const { method, params, id } = request;
 
-// 2. Standard MCP JSON-RPC Endpoint (POST /mcp or POST /rpc)
-app.post(['/mcp', '/rpc'], async (req, res) => {
-    const { jsonrpc, method, params, id } = req.body;
-
-    // Handle MCP tools/list
-    if (method === 'tools/list') {
-        return res.json({
+    // 1. Initialize
+    if (method === 'initialize') {
+        return {
             jsonrpc: "2.0",
-            result: { tools: toolsCatalog },
-            id: id || 1
-        });
+            id,
+            result: {
+                protocolVersion: "2024-11-05",
+                capabilities: {
+                    tools: {
+                        listChanged: false
+                    }
+                },
+                serverInfo: {
+                    name: "whatsapp-mcp-server",
+                    version: "1.0.0"
+                }
+            }
+        };
     }
 
-    // Handle MCP tools/call
+    // 2. Initialized notification
+    if (method === 'notifications/initialized') {
+        return null;
+    }
+
+    // 3. Tools list (Discovery)
+    if (method === 'tools/list') {
+        return {
+            jsonrpc: "2.0",
+            id,
+            result: {
+                tools: mcpTools
+            }
+        };
+    }
+
+    // 4. Tools call (Execution)
     if (method === 'tools/call') {
         const toolName = params?.name;
         const args = params?.arguments || {};
@@ -179,79 +190,105 @@ app.post(['/mcp', '/rpc'], async (req, res) => {
             try {
                 const jid = args.to.includes('@s.whatsapp.net') ? args.to : `${args.to.replace(/[^0-9]/g, '')}@s.whatsapp.net`;
                 if (!sock || clientStatus !== 'READY') {
-                    throw new Error('WhatsApp client is not ready');
+                    throw new Error('WhatsApp is not connected yet.');
                 }
                 await sock.sendMessage(jid, { text: String(args.message) });
-                return res.json({
+                return {
                     jsonrpc: "2.0",
-                    result: { content: [{ type: "text", text: `Message sent successfully to ${jid}` }] },
-                    id: id || 1
-                });
+                    id,
+                    result: {
+                        content: [{ type: "text", text: `Message sent successfully to ${jid}` }],
+                        isError: false
+                    }
+                };
             } catch (err) {
-                return res.json({
+                return {
                     jsonrpc: "2.0",
-                    error: { code: -32000, message: err.message },
-                    id: id || 1
-                });
+                    id,
+                    result: {
+                        content: [{ type: "text", text: `Failed to send: ${err.message}` }],
+                        isError: true
+                    }
+                };
             }
         }
 
         if (toolName === 'get_last_whatsapp_message') {
             const latest = receivedMessages.find(m => !m.isFromMe) || null;
-            return res.json({
+            return {
                 jsonrpc: "2.0",
-                result: { content: [{ type: "text", text: JSON.stringify(latest) }] },
-                id: id || 1
-            });
+                id,
+                result: {
+                    content: [{ type: "text", text: JSON.stringify(latest) }],
+                    isError: false
+                }
+            };
         }
     }
 
-    // Default response
-    res.json({ jsonrpc: "2.0", result: { status: "acknowledged" }, id: id || 1 });
+    // Fallback
+    return {
+        jsonrpc: "2.0",
+        id,
+        error: { code: -32601, message: "Method not found" }
+    };
+}
+
+// ==================================================================
+// 📡 Official MCP SSE Transport Endpoints (GET /sse & POST /messages)
+// ==================================================================
+
+// 1. SSE Connection endpoint
+app.get(['/sse', '/mcp/sse'], (req, res) => {
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    res.flushHeaders();
+
+    const sessionId = crypto.randomUUID();
+    sseSessions.set(sessionId, res);
+
+    console.log(`🔌 MCP SSE client connected: session ${sessionId}`);
+
+    // Send the mandatory MCP 'endpoint' event to tell client where to POST messages
+    res.write(`event: endpoint\ndata: /messages?sessionId=${sessionId}\n\n`);
+
+    req.on('close', () => {
+        console.log(`🔌 MCP SSE client disconnected: session ${sessionId}`);
+        sseSessions.delete(sessionId);
+    });
 });
 
-// 3. REST Execution Endpoints (Direct tool invocation)
-app.post(['/execute', '/api/execute', '/call', '/api/call'], async (req, res) => {
-    const tool = req.body.tool || req.body.name;
-    const params = req.body.parameters || req.body.args || req.body;
+// 2. MCP Messages endpoint (handles incoming RPC calls from client)
+app.post(['/messages', '/mcp/messages'], async (req, res) => {
+    const sessionId = req.query.sessionId;
+    const body = req.body;
 
-    if (tool === 'send_whatsapp_message' || req.path.includes('send')) {
-        const to = params.to || params.phone_number;
-        const message = params.message || params.text;
+    console.log(`📩 MCP Request [${body.method}]:`, JSON.stringify(body));
 
-        if (!to || !message) return res.status(400).json({ error: 'Missing to or message' });
-        if (!sock || clientStatus !== 'READY') return res.status(503).json({ error: 'WhatsApp not ready' });
+    const response = await handleMcpRpc(body);
 
-        try {
-            const jid = to.includes('@s.whatsapp.net') ? to : `${to.replace(/[^0-9]/g, '')}@s.whatsapp.net`;
-            await sock.sendMessage(jid, { text: String(message) });
-            return res.json({ success: true, message: `Sent to ${jid}` });
-        } catch (e) {
-            return res.status(500).json({ error: e.message });
+    if (sessionId && sseSessions.has(sessionId)) {
+        const clientRes = sseSessions.get(sessionId);
+        if (response) {
+            clientRes.write(`event: message\ndata: ${JSON.stringify(response)}\n\n`);
         }
+        res.status(202).send('Accepted');
+    } else {
+        // Return JSON response directly if no active SSE stream
+        res.json(response || { status: 'acknowledged' });
     }
-
-    if (tool === 'get_last_whatsapp_message') {
-        const latest = receivedMessages.find(m => !m.isFromMe) || null;
-        return res.json({ success: true, message: latest });
-    }
-
-    res.json({ success: true, tools: toolsCatalog });
 });
 
-// 4. Backward-compatible /send-message route
-app.post(['/send-message', '/api/send-message'], async (req, res) => {
-    const { to, message } = req.body;
-    if (!to || !message) return res.status(400).json({ error: 'Missing to or message' });
-    if (!sock || clientStatus !== 'READY') return res.status(503).json({ error: 'WhatsApp not ready' });
+// 3. Fallback direct JSON-RPC endpoint
+app.post(['/mcp', '/rpc'], async (req, res) => {
+    const response = await handleMcpRpc(req.body);
+    res.json(response || { status: 'acknowledged' });
+});
 
-    try {
-        const jid = to.includes('@s.whatsapp.net') ? to : `${to.replace(/[^0-9]/g, '')}@s.whatsapp.net`;
-        await sock.sendMessage(jid, { text: String(message) });
-        res.json({ success: true, status: 'sent' });
-    } catch (err) {
-        res.status(500).json({ error: err.message });
-    }
+// 4. Fallback REST tools endpoint
+app.get(['/tools', '/api/tools'], (req, res) => {
+    res.json({ tools: mcpTools });
 });
 
 // ==================================================================
@@ -261,8 +298,8 @@ app.get(['/health', '/status', '/ping'], (req, res) => {
     res.status(200).json({
         status: 'ok',
         whatsappStatus: clientStatus,
-        mcp: 'enabled',
-        tools: toolsCatalog.map(t => t.name),
+        mcp: 'active',
+        tools: mcpTools.map(t => t.name),
         timeIST: getISTDate().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })
     });
 });
@@ -277,8 +314,8 @@ app.get('/', (req, res) => {
                 <body style="font-family: Arial, sans-serif; text-align: center; padding-top: 50px;">
                     <h2 style="color: #25D366;">✅ WhatsApp MCP Connector Server is Online!</h2>
                     <p>Status: <strong>${clientStatus}</strong></p>
-                    <p>MCP Tool Catalog: <code>GET /tools</code></p>
-                    <p>MCP Endpoint: <code>POST /mcp</code></p>
+                    <p>MCP SSE Endpoint: <code>/sse</code></p>
+                    <p>MCP Messages Endpoint: <code>/messages</code></p>
                 </body>
             </html>
         `);
@@ -310,5 +347,5 @@ app.get('/', (req, res) => {
 // ==================================================================
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
-    console.log(`🚀 WhatsApp MCP Connector Server running on port ${PORT}`);
+    console.log(`🚀 WhatsApp MCP Server running on port ${PORT}`);
 });
