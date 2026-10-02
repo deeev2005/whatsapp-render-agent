@@ -1,7 +1,10 @@
 FROM node:20-bookworm-slim
 
-# Install git so npm can fetch any git-based dependencies
-RUN apt-get update && apt-get install -y git --no-install-recommends && rm -rf /var/lib/apt/lists/*
+# Install git and openssh-client
+RUN apt-get update && apt-get install -y git openssh-client --no-install-recommends && rm -rf /var/lib/apt/lists/*
+
+# Force git to use HTTPS instead of SSH for GitHub
+RUN git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
 
 WORKDIR /usr/src/app
 
