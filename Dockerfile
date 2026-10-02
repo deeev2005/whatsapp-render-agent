@@ -1,7 +1,8 @@
 FROM node:20-bookworm-slim
 
-# Install latest Chromium and required dependencies from Debian Bookworm
+# Install git, Chromium, and required dependencies
 RUN apt-get update && apt-get install -y \
+    git \
     chromium \
     fonts-ipafont-gothic \
     fonts-wqy-zenhei \
