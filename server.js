@@ -6,7 +6,6 @@ const axios = require('axios');
 
 const app = express();
 app.use(express.json());
-const PORT = process.env.PORT || 3000;
 
 let currentQR = null;
 let clientStatus = 'STARTING';
@@ -14,6 +13,11 @@ let sock = null;
 
 // Replace this with your actual external API URL (or leave blank for !ping test)
 const EXTERNAL_API_URL = process.env.EXTERNAL_API_URL || ''; 
+
+// Helper function for IST Date
+function getISTDate() {
+    return new Date();
+}
 
 async function startWhatsApp() {
     // Saves auth session in ./baileys_auth folder
@@ -103,7 +107,22 @@ async function startWhatsApp() {
 
 startWhatsApp();
 
-// --- Web Dashboard ---
+// ==================================================================
+// 🩺 Health Check & Ping (Keeps Render Service Awake)
+// ==================================================================
+app.get('/health', (req, res) => {
+    res.json({
+        status: 'ok',
+        whatsappStatus: clientStatus,
+        timeIST: getISTDate().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })
+    });
+});
+
+app.get('/ping', (req, res) => res.status(200).send('OK'));
+
+// ==================================================================
+// 📱 Web Dashboard
+// ==================================================================
 app.get('/', (req, res) => {
     if (clientStatus === 'READY') {
         res.send(`
@@ -139,7 +158,9 @@ app.get('/', (req, res) => {
     }
 });
 
-// --- API endpoint to send WhatsApp message from external servers ---
+// ==================================================================
+// 🚀 Outbound API endpoint to send WhatsApp message from external servers
+// ==================================================================
 app.post('/api/send-message', async (req, res) => {
     const { to, message } = req.body;
     if (!to || !message) {
@@ -158,6 +179,12 @@ app.post('/api/send-message', async (req, res) => {
     }
 });
 
+// ==================================================================
+// 🚀 SERVER START
+// ==================================================================
+const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
-    console.log(`Server listening on port ${PORT}`);
+    console.log('🚀 Server started...');
+    console.log('👂 Monitoring notification collection for new entries...');
+    console.log(`✅ Server running on port ${PORT}`);
 });
