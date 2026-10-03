@@ -167,6 +167,7 @@ async function startWhatsApp() {
                 senderName: senderName,
                 text: text,
                 isFromMe: msg.key.fromMe || false,
+                status: 'unread',
                 timestamp: new Date().toISOString()
             };
             receivedMessages.unshift(record);
@@ -193,21 +194,8 @@ async function startWhatsApp() {
                 continue;
             }
 
-            // 💬 Handle inquiries (Invoices, greetings, help, etc.)
-            try {
-                const reply = generateInvoiceAssistantReply(text, senderName);
-                console.log(`🤖 Sending assistant reply to ${senderJid}...`);
-                await sock.sendMessage(senderJid, { text: reply }, { quoted: msg });
-                console.log(`✅ Assistant reply successfully delivered to ${senderJid}`);
-            } catch (replyErr) {
-                console.error('❌ Error delivering reply with quote, trying unquoted:', replyErr.message);
-                try {
-                    const reply = generateInvoiceAssistantReply(text, senderName);
-                    await sock.sendMessage(senderJid, { text: reply });
-                } catch (fallbackErr) {
-                    console.error('❌ Fatal error sending assistant reply:', fallbackErr.message);
-                }
-            }
+            // 📥 Message is queued for AgenticOrg agent to read via get_last_whatsapp_message tool
+            console.log(`📥 [Queued for AgenticOrg Agent] From: ${senderName} (${senderJid}) | Query: "${text}"`);
         }
     });
 }
@@ -342,6 +330,12 @@ async function handleMcpRpc(request) {
 
             try {
                 const jid = await sendWhatsApp(to, message);
+                // Mark messages from this recipient as processed
+                for (const m of receivedMessages) {
+                    if (m.sender === jid || jid.includes(m.sender.replace(/[^0-9]/g, ''))) {
+                        m.status = 'processed';
+                    }
+                }
                 return {
                     jsonrpc: "2.0",
                     id,
@@ -357,11 +351,44 @@ async function handleMcpRpc(request) {
         }
 
         if (toolName === 'get_last_whatsapp_message') {
-            const latest = receivedMessages.find(m => !m.isFromMe) || receivedMessages[0] || null;
+            const unread = receivedMessages.find(m => !m.isFromMe && m.status === 'unread');
+            const latest = unread || receivedMessages.find(m => !m.isFromMe) || null;
+
+            if (latest) {
+                return {
+                    jsonrpc: "2.0",
+                    id,
+                    result: {
+                        content: [{
+                            type: "text",
+                            text: JSON.stringify({
+                                has_new_message: !!unread,
+                                id: latest.id,
+                                from: latest.sender,
+                                sender_name: latest.senderName,
+                                text: latest.text,
+                                timestamp: latest.timestamp,
+                                status: latest.status
+                            })
+                        }],
+                        isError: false
+                    }
+                };
+            }
+
             return {
                 jsonrpc: "2.0",
                 id,
-                result: { content: [{ type: "text", text: JSON.stringify(latest) }], isError: false }
+                result: {
+                    content: [{
+                        type: "text",
+                        text: JSON.stringify({
+                            has_new_message: false,
+                            message: "No WhatsApp messages found."
+                        })
+                    }],
+                    isError: false
+                }
             };
         }
 
