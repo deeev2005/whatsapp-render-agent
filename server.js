@@ -34,15 +34,20 @@ const receivedMessages = [];
 const sseSessions = new Map();
 
 // Workflow webhook config (set in Render env vars)
-const AGENT_WEBHOOK_URL = process.env.AGENT_WEBHOOK_URL || '';
-const AGENT_API_KEY = process.env.AGENT_API_KEY || '';
+const AGENT_WEBHOOK_URL = (process.env.AGENT_WEBHOOK_URL || '').trim();
+const AGENT_API_KEY = (process.env.AGENT_API_KEY || '').trim();
 
-// 🆕 Media config (set in Render env vars)
+// 🆕 Debug startup info
+console.log(`🔍 [DEBUG] Node ${process.version} | fetch available: ${typeof fetch === 'function'}`);
+console.log(`🔍 [DEBUG] AGENT_WEBHOOK_URL set: ${!!AGENT_WEBHOOK_URL}${AGENT_WEBHOOK_URL ? ` -> ${AGENT_WEBHOOK_URL}` : ''}`);
+console.log(`🔍 [DEBUG] AGENT_API_KEY set: ${!!AGENT_API_KEY}`);
+
+// Media config (set in Render env vars)
 const MEDIA_DIR = process.env.MEDIA_DIR || './media';
 const MAX_MEDIA_BYTES = (Number(process.env.MAX_MEDIA_MB) || 20) * 1024 * 1024;
 fs.mkdirSync(MEDIA_DIR, { recursive: true });
 
-// 🆕 Media helpers
+// Media helpers
 const MEDIA_TYPES = {
     imageMessage: 'image',
     videoMessage: 'video',
@@ -83,7 +88,7 @@ function extFor(mimeType, fileName) {
     return MIME_EXT[base] || 'bin';
 }
 
-// 🆕 Download an incoming media message and save it to disk
+// Download an incoming media message and save it to disk
 async function saveIncomingMedia(msg, mediaMsg, type) {
     const info = {
         type,
@@ -119,23 +124,31 @@ async function triggerWorkflow(record) {
     const headers = { 'Content-Type': 'application/json' };
     if (AGENT_API_KEY) headers['Authorization'] = `Bearer ${AGENT_API_KEY}`;
 
+    const payload = {
+        channel: 'whatsapp',
+        message: record.text,
+        sender: record.sender,
+        senderName: record.senderName,
+        session_id: record.sender,
+        mediaType: record.mediaType,
+        mediaUrl: record.mediaUrl,
+        mimeType: record.mimeType,
+        fileName: record.fileName
+    };
+
+    console.log(`🔍 [DEBUG] POST ${AGENT_WEBHOOK_URL}`);
+    console.log(`🔍 [DEBUG] Payload: ${JSON.stringify(payload)}`);
+
     const resp = await fetch(AGENT_WEBHOOK_URL, {
         method: 'POST',
         headers,
-        body: JSON.stringify({
-            channel: 'whatsapp',
-            message: record.text,
-            sender: record.sender,
-            senderName: record.senderName,
-            session_id: record.sender,
-            mediaType: record.mediaType,
-            mediaUrl: record.mediaUrl,
-            mimeType: record.mimeType,
-            fileName: record.fileName
-        })
+        body: JSON.stringify(payload)
     });
 
-    if (!resp.ok) throw new Error(`Workflow webhook responded with HTTP ${resp.status}`);
+    const respBody = await resp.text();
+    console.log(`🔍 [DEBUG] Webhook response: HTTP ${resp.status} | ${respBody.slice(0, 300)}`);
+
+    if (!resp.ok) throw new Error(`Workflow webhook responded with HTTP ${resp.status}: ${respBody.slice(0, 200)}`);
 }
 
 // ==================================================================
@@ -183,14 +196,21 @@ async function startWhatsApp() {
     // 📩 Bulletproof Message Handler
     sock.ev.on('messages.upsert', async (upsert) => {
         const messages = upsert.messages || [];
+        console.log(`🔍 [DEBUG] messages.upsert type="${upsert.type}" count=${messages.length}`);
 
         for (const msg of messages) {
-            if (!msg.message) continue;
+            if (!msg.message) {
+                console.log('🔍 [DEBUG] Skipped: message has no content');
+                continue;
+            }
 
             const senderJid = msg.key.remoteJid;
-            if (!senderJid || senderJid === 'status@broadcast') continue;
+            if (!senderJid || senderJid === 'status@broadcast') {
+                console.log(`🔍 [DEBUG] Skipped: remoteJid is "${senderJid}"`);
+                continue;
+            }
 
-            // 🆕 Unwrap ephemeral / view-once / document-with-caption wrappers
+            // Unwrap ephemeral / view-once / document-with-caption wrappers
             const content =
                 msg.message.ephemeralMessage?.message ||
                 msg.message.viewOnceMessage?.message ||
@@ -209,7 +229,7 @@ async function startWhatsApp() {
 
             const senderName = msg.pushName || 'User';
 
-            // 🆕 Download media (skip own messages and groups)
+            // Download media (skip own messages and groups)
             const mediaKey = Object.keys(MEDIA_TYPES).find(k => content[k]);
             let media = null;
             if (mediaKey && !msg.key.fromMe && !senderJid.endsWith('@g.us')) {
@@ -218,11 +238,14 @@ async function startWhatsApp() {
 
             // Print every incoming message to Render logs
             console.log(
-                `📩 [WhatsApp RAW] From: ${senderJid} (${senderName}) | Text: "${text}"` +
+                `📩 [WhatsApp RAW] From: ${senderJid} (${senderName}) | fromMe: ${!!msg.key.fromMe} | Text: "${text}"` +
                 (media ? ` | Media: ${media.type} ${media.url || media.error}` : '')
             );
 
-            if (!text && !media) continue;
+            if (!text && !media) {
+                console.log('🔍 [DEBUG] Skipped: no text and no media');
+                continue;
+            }
 
             const record = {
                 id: msg.key.id,
@@ -259,20 +282,25 @@ async function startWhatsApp() {
                         console.error('❌ Fatal error sending pong:', fallbackErr.message);
                     }
                 }
+                console.log('🔍 [DEBUG] Not forwarding: !ping is handled locally');
                 continue;
             }
 
             // Trigger workflow (skip own messages, groups, and old synced messages)
-            if (
-                AGENT_WEBHOOK_URL &&
-                upsert.type === 'notify' &&
-                !msg.key.fromMe &&
-                !senderJid.endsWith('@g.us')
-            ) {
+            const skipReason =
+                !AGENT_WEBHOOK_URL ? 'AGENT_WEBHOOK_URL is not set' :
+                upsert.type !== 'notify' ? `upsert.type is "${upsert.type}" (needs "notify")` :
+                msg.key.fromMe ? 'message is from the linked account itself (fromMe)' :
+                senderJid.endsWith('@g.us') ? 'group chat' :
+                null;
+
+            if (skipReason) {
+                console.log(`🔍 [DEBUG] Not forwarding: ${skipReason}`);
+            } else {
                 console.log(`🤖 Forwarding to workflow: "${text}"`);
                 triggerWorkflow(record)
                     .then(() => console.log(`✅ Workflow triggered for ${senderJid}`))
-                    .catch((err) => console.error('❌ Workflow trigger failed:', err.message));
+                    .catch((err) => console.error(`❌ Workflow trigger failed: ${err.message}${err.cause ? ` | cause: ${err.cause.message || err.cause}` : ''}`));
             }
         }
     });
@@ -386,7 +414,7 @@ async function sendWhatsApp(to, message) {
     return jid;
 }
 
-// 🆕 Core function to send WhatsApp media from a URL
+// Core function to send WhatsApp media from a URL
 async function sendWhatsAppMedia(to, mediaUrl, caption, mediaType, fileName, mimeType) {
     if (!sock || clientStatus !== 'READY') {
         throw new Error('WhatsApp is not connected yet. Please visit the web page and check QR code.');
@@ -645,12 +673,55 @@ app.all(['/tools', '/api/tools'], (req, res) => {
     res.json({ tools: mcpTools });
 });
 
-// 🆕 Serve saved media files
+// Serve saved media files
 app.get('/media/:name', (req, res) => {
     const name = path.basename(req.params.name);
     const filePath = path.resolve(MEDIA_DIR, name);
     if (!fs.existsSync(filePath)) return res.status(404).send('Not found');
     res.sendFile(filePath);
+});
+
+// ==================================================================
+// 🔍 Debug routes (only active when DEBUG_ROUTES=true in Render env)
+// ==================================================================
+function debugOnly(req, res, next) {
+    if (process.env.DEBUG_ROUTES !== 'true') return res.status(404).send('Not found');
+    next();
+}
+
+// Fires a fake message at the n8n webhook, no WhatsApp needed
+app.get('/debug/webhook-test', debugOnly, async (req, res) => {
+    if (!AGENT_WEBHOOK_URL) return res.json({ ok: false, error: 'AGENT_WEBHOOK_URL is not set' });
+    try {
+        await triggerWorkflow({
+            id: 'debug-test',
+            sender: '919999999999@s.whatsapp.net',
+            senderName: 'Debug',
+            text: 'debug test message',
+            mediaType: null,
+            mimeType: null,
+            fileName: null,
+            mediaUrl: null
+        });
+        res.json({ ok: true, url: AGENT_WEBHOOK_URL });
+    } catch (err) {
+        res.json({ ok: false, url: AGENT_WEBHOOK_URL, error: err.message, cause: err.cause?.message || null });
+    }
+});
+
+app.get('/debug/config', debugOnly, (req, res) => {
+    res.json({
+        webhookConfigured: !!AGENT_WEBHOOK_URL,
+        webhookUrl: AGENT_WEBHOOK_URL || null,
+        apiKeySet: !!AGENT_API_KEY,
+        whatsappStatus: clientStatus,
+        nodeVersion: process.version,
+        hasFetch: typeof fetch === 'function'
+    });
+});
+
+app.get('/debug/messages', debugOnly, (req, res) => {
+    res.json(receivedMessages);
 });
 
 // ==================================================================
