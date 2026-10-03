@@ -37,7 +37,7 @@ const sseSessions = new Map();
 const AGENT_WEBHOOK_URL = (process.env.AGENT_WEBHOOK_URL || '').trim();
 const AGENT_API_KEY = (process.env.AGENT_API_KEY || '').trim();
 
-// 🆕 Debug startup info
+// Debug startup info
 console.log(`🔍 [DEBUG] Node ${process.version} | fetch available: ${typeof fetch === 'function'}`);
 console.log(`🔍 [DEBUG] AGENT_WEBHOOK_URL set: ${!!AGENT_WEBHOOK_URL}${AGENT_WEBHOOK_URL ? ` -> ${AGENT_WEBHOOK_URL}` : ''}`);
 console.log(`🔍 [DEBUG] AGENT_API_KEY set: ${!!AGENT_API_KEY}`);
@@ -86,6 +86,24 @@ function extFor(mimeType, fileName) {
     if (fromName) return fromName.replace(/[^a-z0-9]/g, '') || 'bin';
     const base = String(mimeType || '').split(';')[0].trim();
     return MIME_EXT[base] || 'bin';
+}
+
+// 🆕 JID helpers (self-chat detection + message age)
+function jidDigits(jid) {
+    return String(jid || '').split('@')[0].split(':')[0];
+}
+
+function isSelfChat(jid) {
+    const other = jidDigits(jid);
+    const me = jidDigits(sock?.user?.id);
+    const meLid = jidDigits(sock?.user?.lid);
+    return !!other && (other === me || (!!meLid && other === meLid));
+}
+
+function tsToSeconds(ts) {
+    if (!ts) return 0;
+    if (typeof ts === 'object' && typeof ts.toNumber === 'function') return ts.toNumber();
+    return Number(ts) || 0;
 }
 
 // Download an incoming media message and save it to disk
@@ -181,6 +199,7 @@ async function startWhatsApp() {
             clientStatus = 'READY';
             currentQR = null;
             console.log('✅ WhatsApp Agent is ONLINE and READY to receive/send messages!');
+            console.log(`🔍 [DEBUG] Logged in as id=${sock?.user?.id} lid=${sock?.user?.lid || 'n/a'}`);
         }
 
         if (connection === 'close') {
@@ -229,16 +248,25 @@ async function startWhatsApp() {
 
             const senderName = msg.pushName || 'User';
 
-            // Download media (skip own messages and groups)
+            // 🆕 Who sent it, and is it safe to process?
+            const fromMe = !!msg.key.fromMe;
+            const isGroup = senderJid.endsWith('@g.us');
+            const selfChat = fromMe && isSelfChat(senderJid);
+            const ts = tsToSeconds(msg.messageTimestamp);
+            const ageSec = ts ? Math.round(Date.now() / 1000 - ts) : 0;
+            // Bot's own replies echo back as type "append" in the self-chat, so only "notify" counts as typed by you
+            const canProcess = !isGroup && (!fromMe || (selfChat && upsert.type === 'notify'));
+
+            // Download media
             const mediaKey = Object.keys(MEDIA_TYPES).find(k => content[k]);
             let media = null;
-            if (mediaKey && !msg.key.fromMe && !senderJid.endsWith('@g.us')) {
+            if (mediaKey && canProcess) {
                 media = await saveIncomingMedia(msg, content[mediaKey], MEDIA_TYPES[mediaKey]);
             }
 
             // Print every incoming message to Render logs
             console.log(
-                `📩 [WhatsApp RAW] From: ${senderJid} (${senderName}) | fromMe: ${!!msg.key.fromMe} | Text: "${text}"` +
+                `📩 [WhatsApp RAW] From: ${senderJid} (${senderName}) | type: ${upsert.type} | fromMe: ${fromMe} | selfChat: ${selfChat} | age: ${ageSec}s | Text: "${text}"` +
                 (media ? ` | Media: ${media.type} ${media.url || media.error}` : '')
             );
 
@@ -253,7 +281,7 @@ async function startWhatsApp() {
                 senderName: senderName,
                 text: text,
                 timestamp: new Date().toISOString(),
-                isFromMe: !!msg.key.fromMe,
+                isFromMe: fromMe,
                 processed: false,
                 mediaType: media?.type || null,
                 mimeType: media?.mimeType || null,
@@ -286,12 +314,13 @@ async function startWhatsApp() {
                 continue;
             }
 
-            // Trigger workflow (skip own messages, groups, and old synced messages)
+            // Trigger workflow
             const skipReason =
                 !AGENT_WEBHOOK_URL ? 'AGENT_WEBHOOK_URL is not set' :
-                upsert.type !== 'notify' ? `upsert.type is "${upsert.type}" (needs "notify")` :
-                msg.key.fromMe ? 'message is from the linked account itself (fromMe)' :
-                senderJid.endsWith('@g.us') ? 'group chat' :
+                isGroup ? 'group chat' :
+                fromMe && !selfChat ? 'your own message to another chat (only your self-chat is allowed)' :
+                selfChat && upsert.type !== 'notify' ? `echo of a message sent by this server (type "${upsert.type}")` :
+                upsert.type !== 'notify' && ageSec > 120 ? `old message (${ageSec}s old, type "${upsert.type}")` :
                 null;
 
             if (skipReason) {
@@ -407,8 +436,10 @@ async function sendWhatsApp(to, message) {
     if (!sock || clientStatus !== 'READY') {
         throw new Error('WhatsApp is not connected yet. Please visit the web page and check QR code.');
     }
-    const cleanNumber = String(to).replace(/[^0-9]/g, '');
-    const jid = to.includes('@s.whatsapp.net') ? to : `${cleanNumber}@s.whatsapp.net`;
+    const toStr = String(to);
+    const cleanNumber = toStr.replace(/[^0-9]/g, '');
+    // 🆕 Keep any full JID (@s.whatsapp.net, @lid, ...) as-is
+    const jid = toStr.includes('@') ? toStr : `${cleanNumber}@s.whatsapp.net`;
     await sock.sendMessage(jid, { text: String(message) });
     console.log(`📤 Successfully sent WhatsApp message to ${jid}: "${message}"`);
     return jid;
@@ -421,7 +452,8 @@ async function sendWhatsAppMedia(to, mediaUrl, caption, mediaType, fileName, mim
     }
     const toStr = String(to);
     const cleanNumber = toStr.replace(/[^0-9]/g, '');
-    const jid = toStr.includes('@s.whatsapp.net') ? toStr : `${cleanNumber}@s.whatsapp.net`;
+    // 🆕 Keep any full JID (@s.whatsapp.net, @lid, ...) as-is
+    const jid = toStr.includes('@') ? toStr : `${cleanNumber}@s.whatsapp.net`;
 
     const urlPath = new URL(mediaUrl).pathname;
     const ext = path.extname(urlPath).slice(1).toLowerCase();
@@ -715,6 +747,7 @@ app.get('/debug/config', debugOnly, (req, res) => {
         webhookUrl: AGENT_WEBHOOK_URL || null,
         apiKeySet: !!AGENT_API_KEY,
         whatsappStatus: clientStatus,
+        loggedInAs: sock?.user?.id || null,
         nodeVersion: process.version,
         hasFetch: typeof fetch === 'function'
     });
