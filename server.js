@@ -35,6 +35,27 @@ function getISTDate() {
     return new Date();
 }
 
+// 🧠 Real-Time AI LLM Assistant
+async function getLlmReply(userText, senderName) {
+    try {
+        const systemPrompt = `You are the Pine Labs AgenticOrg Enterprise Virtual Employee for Accounts Payable and Invoicing. You are assisting ${senderName} on WhatsApp. Be helpful, professional, and concise. Explain how you automate invoice ingestion, OCR field extraction, GSTIN & tax verification, 3-way PO/GRN matching, and Pine Labs Plural payment queues. Answer the user's inquiry directly.`;
+        const prompt = `${systemPrompt}\n\nCustomer Inquiry: "${userText}"\n\nAssistant Reply:`;
+        
+        const response = await fetch(`https://text.pollinations.ai/${encodeURIComponent(prompt)}`, {
+            signal: AbortSignal.timeout(8000)
+        });
+        if (response.ok) {
+            const text = await response.text();
+            if (text && text.trim().length > 0) {
+                return text.trim();
+            }
+        }
+    } catch (err) {
+        console.warn('LLM fetch error, falling back:', err.message);
+    }
+    return `👋 Hello ${senderName}! I am your Pine Labs AgenticOrg Accounts Payable AI Assistant. I can help you ingest invoices, verify vendor GSTINs, perform 3-way matching against POs, and manage the payment queue. How can I assist with your invoices today?`;
+}
+
 // ==================================================================
 // 📱 WhatsApp Engine (Baileys)
 // ==================================================================
@@ -138,20 +159,19 @@ async function startWhatsApp() {
                 continue;
             }
 
-            // 💬 Reply to any incoming WhatsApp chat message immediately
+            // 💬 Send genuine AI LLM reply to WhatsApp user
             try {
-                await sock.sendMessage(senderJid, { 
-                    text: `👋 Hi ${senderName}! I received your message: "${text}". I have sent this to your AgenticOrg AI Agent to process!` 
-                }, { quoted: msg });
-                console.log(`✅ Reply delivered to ${senderJid}`);
+                console.log(`🤖 Generating LLM reply for "${text}"...`);
+                const llmReply = await getLlmReply(text, senderName);
+                await sock.sendMessage(senderJid, { text: llmReply }, { quoted: msg });
+                console.log(`✅ LLM Reply successfully delivered to ${senderJid}`);
             } catch (replyErr) {
-                console.error('❌ Error delivering reply with quote, trying unquoted:', replyErr.message);
+                console.error('❌ Error delivering LLM reply with quote, trying unquoted:', replyErr.message);
                 try {
-                    await sock.sendMessage(senderJid, { 
-                        text: `👋 Hi ${senderName}! I received your message: "${text}". I have sent this to your AgenticOrg AI Agent to process!` 
-                    });
+                    const llmReply = await getLlmReply(text, senderName);
+                    await sock.sendMessage(senderJid, { text: llmReply });
                 } catch (fallbackErr) {
-                    console.error('❌ Fatal error sending reply:', fallbackErr.message);
+                    console.error('❌ Fatal error sending LLM reply:', fallbackErr.message);
                 }
             }
         }
@@ -259,11 +279,16 @@ async function sendWhatsApp(to, message) {
 
     let targetJid = null;
 
-    if (typeof to === 'string' && to.includes('@s.whatsapp.net')) {
+    if (typeof to === 'string' && (to.includes('@s.whatsapp.net') || to.includes('@lid'))) {
         targetJid = to;
     } else {
         const cleanNumber = String(to || '').replace(/[^0-9]/g, '');
-        if (cleanNumber.length >= 7) {
+        // 1. Check if cleanNumber matches any sender in receivedMessages (preserves @lid or @s.whatsapp.net)
+        const matchingSender = receivedMessages.find(m => m.sender && m.sender.split('@')[0] === cleanNumber);
+        if (matchingSender) {
+            targetJid = matchingSender.sender;
+            console.log(`🔍 Matched recipient ${cleanNumber} to full JID: ${targetJid}`);
+        } else if (cleanNumber.length >= 7) {
             targetJid = `${cleanNumber}@s.whatsapp.net`;
         } else {
             // When LLM passes a name (e.g. "Deepesh Verma"), resolve to their actual WhatsApp JID
@@ -373,7 +398,6 @@ async function handleMcpRpc(request) {
         if (toolName === 'get_last_whatsapp_message') {
             const latest = receivedMessages.find(m => !m.isFromMe) || receivedMessages[0] || null;
             if (latest) {
-                const cleanPhone = latest.sender.replace(/[^0-9]/g, '');
                 return {
                     jsonrpc: "2.0",
                     id,
@@ -381,12 +405,12 @@ async function handleMcpRpc(request) {
                         content: [{
                             type: "text",
                             text: JSON.stringify({
-                                to: cleanPhone,
-                                phone_number: cleanPhone,
+                                to: latest.sender,
+                                recipient: latest.sender,
                                 customer_name: latest.senderName,
                                 inquiry_text: latest.text,
                                 timestamp: latest.timestamp,
-                                reply_instruction: `Call send_whatsapp_message with to="${cleanPhone}" and message="your answer" to reply to ${latest.senderName}.`
+                                reply_instruction: `Call send_whatsapp_message with to="${latest.sender}" and message="your answer" to reply to ${latest.senderName}.`
                             })
                         }],
                         isError: false
