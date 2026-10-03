@@ -32,14 +32,6 @@ let sock = null;
 const receivedMessages = [];
 const sseSessions = new Map();
 
-const axios = require('axios');
-
-// ==================================================================
-// 🤖 AgenticOrg Virtual Employee Configuration (cvgfn)
-// ==================================================================
-const AGENT_ID = process.env.AGENT_ID || '7db40b4b-5493-485e-83bc-98f2093ea31c';
-const AGENTICORG_URL = `https://agenticorg.hackathon.pinelabs.com/api/v1/agents/${AGENT_ID}/run`;
-
 function getISTDate() {
     return new Date();
 }
@@ -96,7 +88,8 @@ async function startWhatsApp() {
     sock = makeWASocket({
         auth: state,
         logger: pino({ level: 'silent' }),
-        printQRInTerminal: false
+        printQRInTerminal: false,
+        syncFullHistory: false
     });
 
     sock.ev.on('creds.update', saveCreds);
@@ -128,29 +121,32 @@ async function startWhatsApp() {
         }
     });
 
-    // 📩 Exact Working Message Listener
-    sock.ev.on('messages.upsert', async ({ messages, type }) => {
-        if (type !== 'notify') return;
+    // 📩 Bulletproof Message Handler
+    sock.ev.on('messages.upsert', async (upsert) => {
+        const messages = upsert.messages || [];
 
         for (const msg of messages) {
             if (!msg.message) continue;
 
             const senderJid = msg.key.remoteJid;
-            if (senderJid === 'status@broadcast') continue;
+            if (!senderJid || senderJid === 'status@broadcast') continue;
 
-            // Robust text extraction supporting all standard text formats
+            // Extract message text across all possible WhatsApp message structures
             const text = 
                 msg.message.conversation || 
                 msg.message.extendedTextMessage?.text || 
                 msg.message.imageMessage?.caption ||
                 msg.message.videoMessage?.caption ||
+                msg.message.documentMessage?.caption ||
                 '';
 
             const senderName = msg.pushName || 'User';
 
+            // Print every incoming message to Render logs
+            console.log(`📩 [WhatsApp RAW] From: ${senderJid} (${senderName}) | Text: "${text}"`);
+
             if (!text) continue;
 
-            // Store message for MCP tools like get_last_whatsapp_message
             const record = {
                 id: msg.key.id,
                 sender: senderJid,
@@ -162,65 +158,40 @@ async function startWhatsApp() {
             receivedMessages.unshift(record);
             if (receivedMessages.length > 50) receivedMessages.pop();
 
-            console.log(`📩 [WhatsApp Message from ${senderName} (${senderJid})]: "${text}"`);
-
-            // 1. Built-in test ping
+            // 🏓 Handle !ping command (handles '!ping', '!ping ', case-insensitive)
             if (text.toLowerCase().trim() === '!ping') {
                 try {
-                    await sock.sendMessage(senderJid, { text: 'pong! 🏓 WhatsApp Connector is active and connected.' });
-                    console.log(`✅ pong sent successfully to ${senderJid}`);
-                } catch (sendErr) {
-                    console.error('❌ Failed to send pong reply:', sendErr.message);
+                    console.log(`🏓 Triggering pong reply to ${senderJid}...`);
+                    await sock.sendMessage(senderJid, { 
+                        text: 'pong! 🏓 WhatsApp Connector is active and connected.' 
+                    }, { quoted: msg });
+                    console.log(`✅ Pong reply successfully delivered to ${senderJid}`);
+                } catch (replyErr) {
+                    console.error('❌ Error delivering pong reply with quote, trying unquoted:', replyErr.message);
+                    try {
+                        await sock.sendMessage(senderJid, { 
+                            text: 'pong! 🏓 WhatsApp Connector is active and connected.' 
+                        });
+                    } catch (fallbackErr) {
+                        console.error('❌ Fatal error sending pong:', fallbackErr.message);
+                    }
                 }
                 continue;
             }
 
-            // 2. Process message via AgenticOrg or Smart Invoice AI Assistant
+            // 💬 Handle inquiries (Invoices, greetings, help, etc.)
             try {
-                let replied = false;
-                const AGENTICORG_API_KEY = process.env.AGENTICORG_API_KEY || '';
-
-                // Try AgenticOrg Agent if API Key is configured
-                if (AGENTICORG_API_KEY) {
-                    try {
-                        console.log(`🤖 Invoking AgenticOrg Agent [${AGENT_ID}]...`);
-                        const payload = {
-                            action: "run",
-                            inputs: {
-                                task: `Customer (${senderName}) sent this inquiry: "${text}". Answer their question and send the reply back to ${senderJid} using your send_whatsapp_message tool.`
-                            }
-                        };
-                        const headers = {
-                            'Content-Type': 'application/json',
-                            'Authorization': `Bearer ${AGENTICORG_API_KEY}`
-                        };
-                        const agentRes = await axios.post(AGENTICORG_URL, payload, { headers, timeout: 30000 });
-                        const rawOutput = agentRes.data?.output?.raw_output || agentRes.data?.output?.response;
-                        if (rawOutput && typeof rawOutput === 'string') {
-                            await sock.sendMessage(senderJid, { text: rawOutput });
-                            replied = true;
-                            console.log('✅ Sent AgenticOrg response to WhatsApp');
-                        }
-                    } catch (agentErr) {
-                        console.warn('⚠️ AgenticOrg API call failed or unauthorized:', agentErr.response?.data?.detail || agentErr.message);
-                    }
-                }
-
-                // If AgenticOrg didn't reply (no API key, 401 Unauthorized, or no text), provide instant Smart Invoice Assistant
-                if (!replied) {
-                    console.log(`💡 Generating intelligent reply for: "${text}"`);
-                    const replyText = generateInvoiceAssistantReply(text, senderName);
-                    await sock.sendMessage(senderJid, { text: replyText });
-                    console.log(`✅ Sent Assistant reply to ${senderJid}`);
-                }
-            } catch (err) {
-                console.error('❌ Error handling message:', err.message);
+                const reply = generateInvoiceAssistantReply(text, senderName);
+                console.log(`🤖 Sending assistant reply to ${senderJid}...`);
+                await sock.sendMessage(senderJid, { text: reply }, { quoted: msg });
+                console.log(`✅ Assistant reply successfully delivered to ${senderJid}`);
+            } catch (replyErr) {
+                console.error('❌ Error delivering reply with quote, trying unquoted:', replyErr.message);
                 try {
-                    await sock.sendMessage(senderJid, {
-                        text: `👋 Hi ${senderName}! I received your message: "${text}". How can I assist you with your invoices today?`
-                    });
-                } catch (e) {
-                    console.error('❌ Failed fallback send:', e.message);
+                    const reply = generateInvoiceAssistantReply(text, senderName);
+                    await sock.sendMessage(senderJid, { text: reply });
+                } catch (fallbackErr) {
+                    console.error('❌ Fatal error sending assistant reply:', fallbackErr.message);
                 }
             }
         }
