@@ -1,8 +1,10 @@
 const express = require('express');
-const { default: makeWASocket, useMultiFileAuthState, DisconnectReason } = require('@whiskeysockets/baileys');
+const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, downloadMediaMessage } = require('@whiskeysockets/baileys');
 const pino = require('pino');
 const QRCode = require('qrcode');
 const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
 
 const app = express();
 app.use(express.json());
@@ -35,6 +37,79 @@ const sseSessions = new Map();
 const AGENT_WEBHOOK_URL = process.env.AGENT_WEBHOOK_URL || '';
 const AGENT_API_KEY = process.env.AGENT_API_KEY || '';
 
+// 🆕 Media config (set in Render env vars)
+const MEDIA_DIR = process.env.MEDIA_DIR || './media';
+const MAX_MEDIA_BYTES = (Number(process.env.MAX_MEDIA_MB) || 20) * 1024 * 1024;
+fs.mkdirSync(MEDIA_DIR, { recursive: true });
+
+// 🆕 Media helpers
+const MEDIA_TYPES = {
+    imageMessage: 'image',
+    videoMessage: 'video',
+    audioMessage: 'audio',
+    documentMessage: 'document'
+};
+
+const MIME_EXT = {
+    'image/jpeg': 'jpg',
+    'image/png': 'png',
+    'image/webp': 'webp',
+    'video/mp4': 'mp4',
+    'audio/ogg': 'ogg',
+    'audio/mpeg': 'mp3',
+    'audio/mp4': 'm4a',
+    'application/pdf': 'pdf',
+    'text/plain': 'txt',
+    'application/msword': 'doc',
+    'application/vnd.openxmlformats-officedocument.wordprocessingml.document': 'docx',
+    'application/vnd.ms-excel': 'xls',
+    'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': 'xlsx'
+};
+
+const EXT_MIME = {
+    jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', webp: 'image/webp',
+    mp4: 'video/mp4', mov: 'video/quicktime',
+    ogg: 'audio/ogg', mp3: 'audio/mpeg', m4a: 'audio/mp4', wav: 'audio/wav', opus: 'audio/ogg',
+    pdf: 'application/pdf', txt: 'text/plain', doc: 'application/msword',
+    docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    xls: 'application/vnd.ms-excel',
+    xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+};
+
+function extFor(mimeType, fileName) {
+    const fromName = fileName ? path.extname(fileName).slice(1).toLowerCase() : '';
+    if (fromName) return fromName.replace(/[^a-z0-9]/g, '') || 'bin';
+    const base = String(mimeType || '').split(';')[0].trim();
+    return MIME_EXT[base] || 'bin';
+}
+
+// 🆕 Download an incoming media message and save it to disk
+async function saveIncomingMedia(msg, mediaMsg, type) {
+    const info = {
+        type,
+        mimeType: mediaMsg.mimetype || null,
+        fileName: mediaMsg.fileName || null
+    };
+    const sizeBytes = Number(mediaMsg.fileLength || 0);
+    if (sizeBytes > MAX_MEDIA_BYTES) {
+        return { ...info, error: 'file_too_large' };
+    }
+    try {
+        const buffer = await downloadMediaMessage(
+            msg,
+            'buffer',
+            {},
+            { logger: pino({ level: 'silent' }), reuploadRequest: sock.updateMediaMessage }
+        );
+        const name = `${crypto.randomUUID()}.${extFor(info.mimeType, info.fileName)}`;
+        await fs.promises.writeFile(path.join(MEDIA_DIR, name), buffer);
+        return { ...info, url: `${RENDER_URL}/media/${name}` };
+    } catch (err) {
+        console.error('❌ Media download failed:', err.message);
+        return { ...info, error: err.message };
+    }
+}
+
 function getISTDate() {
     return new Date();
 }
@@ -52,7 +127,11 @@ async function triggerWorkflow(record) {
             message: record.text,
             sender: record.sender,
             senderName: record.senderName,
-            session_id: record.sender
+            session_id: record.sender,
+            mediaType: record.mediaType,
+            mediaUrl: record.mediaUrl,
+            mimeType: record.mimeType,
+            fileName: record.fileName
         })
     });
 
@@ -111,21 +190,39 @@ async function startWhatsApp() {
             const senderJid = msg.key.remoteJid;
             if (!senderJid || senderJid === 'status@broadcast') continue;
 
+            // 🆕 Unwrap ephemeral / view-once / document-with-caption wrappers
+            const content =
+                msg.message.ephemeralMessage?.message ||
+                msg.message.viewOnceMessage?.message ||
+                msg.message.viewOnceMessageV2?.message ||
+                msg.message.documentWithCaptionMessage?.message ||
+                msg.message;
+
             // Extract message text across all possible WhatsApp message structures
             const text = 
-                msg.message.conversation || 
-                msg.message.extendedTextMessage?.text || 
-                msg.message.imageMessage?.caption ||
-                msg.message.videoMessage?.caption ||
-                msg.message.documentMessage?.caption ||
+                content.conversation || 
+                content.extendedTextMessage?.text || 
+                content.imageMessage?.caption ||
+                content.videoMessage?.caption ||
+                content.documentMessage?.caption ||
                 '';
 
             const senderName = msg.pushName || 'User';
 
-            // Print every incoming message to Render logs
-            console.log(`📩 [WhatsApp RAW] From: ${senderJid} (${senderName}) | Text: "${text}"`);
+            // 🆕 Download media (skip own messages and groups)
+            const mediaKey = Object.keys(MEDIA_TYPES).find(k => content[k]);
+            let media = null;
+            if (mediaKey && !msg.key.fromMe && !senderJid.endsWith('@g.us')) {
+                media = await saveIncomingMedia(msg, content[mediaKey], MEDIA_TYPES[mediaKey]);
+            }
 
-            if (!text) continue;
+            // Print every incoming message to Render logs
+            console.log(
+                `📩 [WhatsApp RAW] From: ${senderJid} (${senderName}) | Text: "${text}"` +
+                (media ? ` | Media: ${media.type} ${media.url || media.error}` : '')
+            );
+
+            if (!text && !media) continue;
 
             const record = {
                 id: msg.key.id,
@@ -134,7 +231,12 @@ async function startWhatsApp() {
                 text: text,
                 timestamp: new Date().toISOString(),
                 isFromMe: !!msg.key.fromMe,
-                processed: false
+                processed: false,
+                mediaType: media?.type || null,
+                mimeType: media?.mimeType || null,
+                fileName: media?.fileName || null,
+                mediaUrl: media?.url || null,
+                mediaError: media?.error || null
             };
             receivedMessages.unshift(record);
             if (receivedMessages.length > 50) receivedMessages.pop();
@@ -220,7 +322,7 @@ const mcpTools = [
     },
     {
         name: "get_last_whatsapp_message",
-        description: "Retrieves the most recent incoming message received from a user on WhatsApp.",
+        description: "Retrieves the most recent incoming message received from a user on WhatsApp. If the message has media, the result includes mediaType, mimeType, fileName and mediaUrl.",
         inputSchema: {
             type: "object",
             properties: {}
@@ -244,15 +346,18 @@ const mcpTools = [
     },
     {
         name: "send_media_message",
-        description: "Sends a media message (image/document) via WhatsApp.",
+        description: "Sends a media message (image, video, audio or document) via WhatsApp from a public media URL.",
         inputSchema: {
             type: "object",
             properties: {
                 to: { type: "string" },
-                media_url: { type: "string" },
-                caption: { type: "string" }
+                media_url: { type: "string", description: "Public URL of the file to send" },
+                caption: { type: "string" },
+                media_type: { type: "string", enum: ["image", "video", "audio", "document"], description: "Optional. Guessed from the URL extension if omitted" },
+                file_name: { type: "string", description: "Optional file name for documents" },
+                mime_type: { type: "string", description: "Optional MIME type" }
             },
-            required: ["to"]
+            required: ["to", "media_url"]
         }
     },
     {
@@ -278,6 +383,51 @@ async function sendWhatsApp(to, message) {
     const jid = to.includes('@s.whatsapp.net') ? to : `${cleanNumber}@s.whatsapp.net`;
     await sock.sendMessage(jid, { text: String(message) });
     console.log(`📤 Successfully sent WhatsApp message to ${jid}: "${message}"`);
+    return jid;
+}
+
+// 🆕 Core function to send WhatsApp media from a URL
+async function sendWhatsAppMedia(to, mediaUrl, caption, mediaType, fileName, mimeType) {
+    if (!sock || clientStatus !== 'READY') {
+        throw new Error('WhatsApp is not connected yet. Please visit the web page and check QR code.');
+    }
+    const toStr = String(to);
+    const cleanNumber = toStr.replace(/[^0-9]/g, '');
+    const jid = toStr.includes('@s.whatsapp.net') ? toStr : `${cleanNumber}@s.whatsapp.net`;
+
+    const urlPath = new URL(mediaUrl).pathname;
+    const ext = path.extname(urlPath).slice(1).toLowerCase();
+
+    let type = mediaType;
+    if (!type) {
+        if (['jpg', 'jpeg', 'png', 'webp'].includes(ext)) type = 'image';
+        else if (['mp4', 'mov', 'mkv'].includes(ext)) type = 'video';
+        else if (['ogg', 'mp3', 'm4a', 'wav', 'opus'].includes(ext)) type = 'audio';
+        else type = 'document';
+    }
+    const mime = mimeType || EXT_MIME[ext] || 'application/octet-stream';
+
+    let payload;
+    if (type === 'image') {
+        payload = { image: { url: mediaUrl }, caption: caption || undefined };
+    } else if (type === 'video') {
+        payload = { video: { url: mediaUrl }, caption: caption || undefined };
+    } else if (type === 'audio') {
+        payload = { audio: { url: mediaUrl }, mimetype: mime, ptt: false };
+    } else {
+        payload = {
+            document: { url: mediaUrl },
+            mimetype: mime,
+            fileName: fileName || path.basename(urlPath) || 'file',
+            caption: caption || undefined
+        };
+    }
+
+    await sock.sendMessage(jid, payload);
+    if (type === 'audio' && caption) {
+        await sock.sendMessage(jid, { text: String(caption) });
+    }
+    console.log(`📤 Successfully sent WhatsApp ${type} to ${jid}: ${mediaUrl}`);
     return jid;
 }
 
@@ -397,8 +547,21 @@ async function handleMcpRpc(request) {
         if (toolName === 'send_media_message') {
             try {
                 const to = args.to || args.recipient;
+                const mediaUrl = args.media_url || args.url;
                 const caption = args.caption || args.text || '';
-                const jid = await sendWhatsApp(to, caption);
+
+                if (!to || !mediaUrl) {
+                    return {
+                        jsonrpc: "2.0",
+                        id,
+                        result: {
+                            content: [{ type: "text", text: "Error: Both 'to' and 'media_url' parameters are required." }],
+                            isError: true
+                        }
+                    };
+                }
+
+                const jid = await sendWhatsAppMedia(to, mediaUrl, caption, args.media_type, args.file_name, args.mime_type);
                 return {
                     jsonrpc: "2.0",
                     id,
@@ -480,6 +643,14 @@ app.post(['/messages', '/mcp/messages'], async (req, res) => {
 // REST Fallback for tools
 app.all(['/tools', '/api/tools'], (req, res) => {
     res.json({ tools: mcpTools });
+});
+
+// 🆕 Serve saved media files
+app.get('/media/:name', (req, res) => {
+    const name = path.basename(req.params.name);
+    const filePath = path.resolve(MEDIA_DIR, name);
+    if (!fs.existsSync(filePath)) return res.status(404).send('Not found');
+    res.sendFile(filePath);
 });
 
 // ==================================================================
