@@ -84,8 +84,11 @@ async function startWhatsApp() {
         for (const msg of messages) {
             if (!msg.message) continue;
 
+            // 🛑 CRITICAL: Ignore own outgoing messages to prevent infinite reply loops!
+            if (msg.key.fromMe) continue;
+
             const senderJid = msg.key.remoteJid;
-            if (!senderJid || senderJid === 'status@broadcast') continue;
+            if (!senderJid || senderJid === 'status@broadcast' || senderJid.endsWith('@g.us')) continue;
 
             // Extract message text across all possible WhatsApp message structures
             const text = 
@@ -108,6 +111,7 @@ async function startWhatsApp() {
                 sender: senderJid,
                 senderName: senderName,
                 text: text,
+                isFromMe: false,
                 timestamp: new Date().toISOString()
             };
             receivedMessages.unshift(record);
@@ -130,6 +134,24 @@ async function startWhatsApp() {
                     } catch (fallbackErr) {
                         console.error('❌ Fatal error sending pong:', fallbackErr.message);
                     }
+                }
+                continue;
+            }
+
+            // 💬 Reply to any incoming WhatsApp chat message immediately
+            try {
+                await sock.sendMessage(senderJid, { 
+                    text: `👋 Hi ${senderName}! I received your message: "${text}". I have sent this to your AgenticOrg AI Agent to process!` 
+                }, { quoted: msg });
+                console.log(`✅ Reply delivered to ${senderJid}`);
+            } catch (replyErr) {
+                console.error('❌ Error delivering reply with quote, trying unquoted:', replyErr.message);
+                try {
+                    await sock.sendMessage(senderJid, { 
+                        text: `👋 Hi ${senderName}! I received your message: "${text}". I have sent this to your AgenticOrg AI Agent to process!` 
+                    });
+                } catch (fallbackErr) {
+                    console.error('❌ Fatal error sending reply:', fallbackErr.message);
                 }
             }
         }
@@ -229,16 +251,49 @@ const mcpTools = [
     }
 ];
 
-// Core function to send WhatsApp messages
+// Core function to send WhatsApp messages (Auto-resolves names like "Deepesh Verma" to phone numbers)
 async function sendWhatsApp(to, message) {
     if (!sock || clientStatus !== 'READY') {
         throw new Error('WhatsApp is not connected yet. Please visit the web page and check QR code.');
     }
-    const cleanNumber = String(to).replace(/[^0-9]/g, '');
-    const jid = to.includes('@s.whatsapp.net') ? to : `${cleanNumber}@s.whatsapp.net`;
-    await sock.sendMessage(jid, { text: String(message) });
-    console.log(`📤 Successfully sent WhatsApp message to ${jid}: "${message}"`);
-    return jid;
+
+    let targetJid = null;
+
+    if (typeof to === 'string' && to.includes('@s.whatsapp.net')) {
+        targetJid = to;
+    } else {
+        const cleanNumber = String(to || '').replace(/[^0-9]/g, '');
+        if (cleanNumber.length >= 7) {
+            targetJid = `${cleanNumber}@s.whatsapp.net`;
+        } else {
+            // When LLM passes a name (e.g. "Deepesh Verma"), resolve to their actual WhatsApp JID
+            const toStr = String(to || '').toLowerCase().trim();
+            const found = receivedMessages.find(m => 
+                (m.senderName && m.senderName.toLowerCase().includes(toStr)) ||
+                (toStr && toStr.includes((m.senderName || '').toLowerCase()))
+            ) || receivedMessages.find(m => !m.isFromMe);
+
+            if (found && found.sender) {
+                targetJid = found.sender;
+                console.log(`🔍 Auto-resolved recipient name "${to}" to WhatsApp user: ${targetJid} (${found.senderName})`);
+            }
+        }
+    }
+
+    // Fallback to most recent user
+    if (!targetJid) {
+        const lastUser = receivedMessages.find(m => !m.isFromMe);
+        if (lastUser && lastUser.sender) {
+            targetJid = lastUser.sender;
+            console.log(`⚠️ Fallback to last active sender: ${targetJid}`);
+        } else {
+            throw new Error(`Unable to resolve recipient "${to}" to a valid WhatsApp contact.`);
+        }
+    }
+
+    await sock.sendMessage(targetJid, { text: String(message) });
+    console.log(`📤 Successfully sent WhatsApp message to ${targetJid}: "${message}"`);
+    return targetJid;
 }
 
 // MCP JSON-RPC Handler
@@ -317,11 +372,32 @@ async function handleMcpRpc(request) {
 
         if (toolName === 'get_last_whatsapp_message') {
             const latest = receivedMessages.find(m => !m.isFromMe) || receivedMessages[0] || null;
+            if (latest) {
+                const cleanPhone = latest.sender.replace(/[^0-9]/g, '');
+                return {
+                    jsonrpc: "2.0",
+                    id,
+                    result: {
+                        content: [{
+                            type: "text",
+                            text: JSON.stringify({
+                                to: cleanPhone,
+                                phone_number: cleanPhone,
+                                customer_name: latest.senderName,
+                                inquiry_text: latest.text,
+                                timestamp: latest.timestamp,
+                                reply_instruction: `Call send_whatsapp_message with to="${cleanPhone}" and message="your answer" to reply to ${latest.senderName}.`
+                            })
+                        }],
+                        isError: false
+                    }
+                };
+            }
             return {
                 jsonrpc: "2.0",
                 id,
                 result: {
-                    content: [{ type: "text", text: JSON.stringify(latest) }],
+                    content: [{ type: "text", text: JSON.stringify({ message: "No WhatsApp messages found." }) }],
                     isError: false
                 }
             };
