@@ -31,6 +31,7 @@ let sock = null;
 // In-memory store for recent messages
 const receivedMessages = [];
 const sseSessions = new Map();
+const processedMessageIds = new Set();
 
 function getISTDate() {
     return new Date();
@@ -128,8 +129,21 @@ async function startWhatsApp() {
         for (const msg of messages) {
             if (!msg.message) continue;
 
+            // 🛑 CRITICAL: Ignore own messages to stop infinite bot loops!
+            if (msg.key.fromMe) continue;
+
             const senderJid = msg.key.remoteJid;
-            if (!senderJid || senderJid === 'status@broadcast') continue;
+            if (!senderJid || senderJid === 'status@broadcast' || senderJid.endsWith('@g.us')) continue;
+
+            // Deduplicate incoming messages
+            if (msg.key.id) {
+                if (processedMessageIds.has(msg.key.id)) continue;
+                processedMessageIds.add(msg.key.id);
+                if (processedMessageIds.size > 2000) {
+                    const first = processedMessageIds.values().next().value;
+                    processedMessageIds.delete(first);
+                }
+            }
 
             // Extract message text across all possible WhatsApp message structures
             const text = 
