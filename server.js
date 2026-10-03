@@ -31,7 +31,7 @@ let sock = null;
 const receivedMessages = [];
 const sseSessions = new Map();
 
-// 🆕 Workflow webhook config (set in Render env vars)
+// Workflow webhook config (set in Render env vars)
 const AGENT_WEBHOOK_URL = process.env.AGENT_WEBHOOK_URL || '';
 const AGENT_API_KEY = process.env.AGENT_API_KEY || '';
 
@@ -39,7 +39,7 @@ function getISTDate() {
     return new Date();
 }
 
-// 🆕 Trigger the workflow with the incoming message (workflow sends the reply itself)
+// Trigger the workflow with the incoming message (workflow sends the reply itself)
 async function triggerWorkflow(record) {
     const headers = { 'Content-Type': 'application/json' };
     if (AGENT_API_KEY) headers['Authorization'] = `Bearer ${AGENT_API_KEY}`;
@@ -132,7 +132,9 @@ async function startWhatsApp() {
                 sender: senderJid,
                 senderName: senderName,
                 text: text,
-                timestamp: new Date().toISOString()
+                timestamp: new Date().toISOString(),
+                isFromMe: !!msg.key.fromMe,
+                processed: false
             };
             receivedMessages.unshift(record);
             if (receivedMessages.length > 50) receivedMessages.pop();
@@ -158,7 +160,7 @@ async function startWhatsApp() {
                 continue;
             }
 
-            // 🆕 Trigger workflow (skip own messages, groups, and old synced messages)
+            // Trigger workflow (skip own messages, groups, and old synced messages)
             if (
                 AGENT_WEBHOOK_URL &&
                 upsert.type === 'notify' &&
@@ -354,12 +356,17 @@ async function handleMcpRpc(request) {
         }
 
         if (toolName === 'get_last_whatsapp_message') {
-            const latest = receivedMessages.find(m => !m.isFromMe) || receivedMessages[0] || null;
+            // Oldest unprocessed incoming message (list is newest-first, so take the last match)
+            const pending = receivedMessages.filter(
+                m => !m.processed && !m.isFromMe && !m.sender.endsWith('@g.us')
+            );
+            const next = pending.length ? pending[pending.length - 1] : null;
+            if (next) next.processed = true;
             return {
                 jsonrpc: "2.0",
                 id,
                 result: {
-                    content: [{ type: "text", text: JSON.stringify(latest) }],
+                    content: [{ type: "text", text: next ? JSON.stringify(next) : JSON.stringify({ no_new_message: true }) }],
                     isError: false
                 }
             };
