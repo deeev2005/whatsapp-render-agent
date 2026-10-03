@@ -31,8 +31,32 @@ let sock = null;
 const receivedMessages = [];
 const sseSessions = new Map();
 
+// 🆕 Workflow webhook config (set in Render env vars)
+const AGENT_WEBHOOK_URL = process.env.AGENT_WEBHOOK_URL || '';
+const AGENT_API_KEY = process.env.AGENT_API_KEY || '';
+
 function getISTDate() {
     return new Date();
+}
+
+// 🆕 Trigger the workflow with the incoming message (workflow sends the reply itself)
+async function triggerWorkflow(record) {
+    const headers = { 'Content-Type': 'application/json' };
+    if (AGENT_API_KEY) headers['Authorization'] = `Bearer ${AGENT_API_KEY}`;
+
+    const resp = await fetch(AGENT_WEBHOOK_URL, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+            channel: 'whatsapp',
+            message: record.text,
+            sender: record.sender,
+            senderName: record.senderName,
+            session_id: record.sender
+        })
+    });
+
+    if (!resp.ok) throw new Error(`Workflow webhook responded with HTTP ${resp.status}`);
 }
 
 // ==================================================================
@@ -131,6 +155,20 @@ async function startWhatsApp() {
                         console.error('❌ Fatal error sending pong:', fallbackErr.message);
                     }
                 }
+                continue;
+            }
+
+            // 🆕 Trigger workflow (skip own messages, groups, and old synced messages)
+            if (
+                AGENT_WEBHOOK_URL &&
+                upsert.type === 'notify' &&
+                !msg.key.fromMe &&
+                !senderJid.endsWith('@g.us')
+            ) {
+                console.log(`🤖 Forwarding to workflow: "${text}"`);
+                triggerWorkflow(record)
+                    .then(() => console.log(`✅ Workflow triggered for ${senderJid}`))
+                    .catch((err) => console.error('❌ Workflow trigger failed:', err.message));
             }
         }
     });
